@@ -20,7 +20,7 @@ use benilla_protocol::field::{
     FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
     FIELD_UNIT_MAXHEALTH,
 };
-use benilla_protocol::messages::{AttackerState, Billing, ObjectType};
+use benilla_protocol::messages::{AttackerState, Billing, ObjectType, ACCOUNT_DATA_SECTIONS};
 use benilla_protocol::{
     CharEnumItem, Character, EntityKind, LoginStage, MonsterMoveFacing, MoveSpeeds, ObjectFields,
     RealmInfo, RosterCause, SessionEvent,
@@ -40,11 +40,15 @@ const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
 const FACTION_PLAYER: u32 = 1;
 const FACTION_HOSTILE: u32 = 14;
 
-/// The battlefield anchor: Northshire, the client's own boot anchor, map 0 (Eastern Kingdoms).
-/// One DQQ unit is [`YARDS_PER_UNIT`] yards (architecture §5.2).
+/// Free mode's spot: Northshire, the client's own boot anchor, map 0 (Eastern Kingdoms).
 const MAP_ID: u32 = 0;
 const ORIGIN: [f32; 3] = [-8949.95, -132.49, 83.6];
+/// The battlefield (for now one open field in Northshire, architecture §5.2): DQQ's 10×10 field is
+/// centred here, one DQQ unit [`YARDS_PER_UNIT`] yards.
+const BATTLE_CENTER: [f32; 3] = [-8934.95, -117.49, 83.6];
+const DQQ_FIELD_HALF: f64 = 5.0;
 const YARDS_PER_UNIT: f32 = 3.0;
+
 
 /// Is Exile mode on? `EXILE_RUNTIME` names the runtime's WebSocket.
 pub(super) fn runtime_url() -> Option<String> {
@@ -124,11 +128,13 @@ fn ws_loop(url: &str, inbound: &Sender<Value>, outbound: &Receiver<String>) {
                 return;
             }
             Ok(_) => {}
+            // The read timeout ending a wait: on Windows it can also surface as
+            // ERROR_IO_PENDING (997) or WSAEWOULDBLOCK (10035), which are no failure either.
             Err(tungstenite::Error::Io(e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
+                ) || matches!(e.raw_os_error(), Some(997 | 10035 | 10060)) => {}
             Err(e) => {
                 bevy::log::error!("exile: runtime link failed: {e}");
                 return;
@@ -153,6 +159,20 @@ struct Shown {
 /// How long after entering the world the auto combat starts: the entry load must have drained,
 /// or the frames land on a loading screen.
 const AUTOCOMBAT_DELAY: Duration = Duration::from_secs(10);
+
+/// Free mode, or where the trip into and out of a combat stands (D27–D29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Free mode: the player plays the character with the stock controls.
+    Free,
+    /// Control is taken and the battlefield's loading screen (with its bar) is up; the replay is
+    /// asked for when the client acks the port, i.e. when the load is done (D28).
+    Porting,
+    /// The replay plays: the player's own body is the combat's creator.
+    Combat,
+    /// The way home: control returns when the client acks that port.
+    Returning,
+}
 /// How long a finished combat's units stay before they are removed.
 const CLEAR_DELAY: Duration = Duration::from_secs(3);
 
@@ -222,12 +242,17 @@ struct Bridge {
     roster: Vec<Character>,
     dqq_ids: HashMap<u64, String>,
     self_guid: Option<u64>,
+    /// The roster entry played, to create the player's own unit again after each worldport.
+    me: Option<Character>,
     /// DQQ actor id → its world unit.
     shown: HashMap<String, Shown>,
     next_creature: u64,
     /// The `combatId` being shown.
     combat: Option<String>,
     models: ModelBook,
+    phase: Phase,
+    /// The combat creator's DQQ actor id, whom the player's own body plays (D28).
+    focus: Option<String>,
     /// When the auto combat is due, and when a finished combat's units go.
     combat_due: Option<Instant>,
     clear_due: Option<Instant>,
@@ -255,10 +280,13 @@ impl Bridge {
             roster: Vec::new(),
             dqq_ids: HashMap::new(),
             self_guid: None,
+            me: None,
             shown: HashMap::new(),
             next_creature: 0xF130_0000_0000_0001,
             combat: None,
             models: ModelBook::load(),
+            phase: Phase::Free,
+            focus: None,
             combat_due: None,
             clear_due: None,
             spline_id: 0,
@@ -293,7 +321,10 @@ impl Bridge {
                     Ok(p) => self.on_park(p),
                     Err(_) => return,
                 },
-                recv(cmd_rx) -> m => if m.is_err() { return },
+                recv(cmd_rx) -> m => match m {
+                    Ok(cmd) => self.on_command(&cmd),
+                    Err(_) => return,
+                },
                 recv(ws_rx) -> m => match m {
                     Ok(v) => self.on_runtime(&v),
                     Err(_) => {
@@ -309,20 +340,81 @@ impl Bridge {
         }
     }
 
-    /// The delayed auto combat and the clear after a combat.
+    /// The player's commands: in free mode the stock client handles them all; `.replay` typed in
+    /// chat starts a combat replay (a stand-in until the addon UI). During a replay nothing the
+    /// player does reaches the combat (D29).
+    fn on_command(&mut self, cmd: &ClientCommand) {
+        match cmd {
+            ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
+                self.start_replay();
+            }
+            // The worldport's load is done.
+            ClientCommand::WorldportAck => match self.phase {
+                Phase::Porting => {
+                    // A worldport clears the world; the player's own unit comes again, as a server
+                    // re-sends it after the port.
+                    self.create_self(BATTLE_CENTER);
+                    let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
+                    self.send("combat.replay", json!({ "characterId": id, "mode": "watch" }));
+                    self.phase = Phase::Combat;
+                }
+                Phase::Returning => {
+                    self.create_self(ORIGIN);
+                    if let Some(me) = self.self_guid {
+                        self.emit(SessionEvent::ClientControl { mover: me, allow_move: true });
+                    }
+                    self.phase = Phase::Free;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// D28: control taken and the port to the battlefield, whose loading screen is the "bar"; the
+    /// replay starts on the port's ack ([`Self::on_command`]).
+    fn start_replay(&mut self) {
+        let Some(me) = self.self_guid else { return };
+        if self.phase != Phase::Free {
+            bevy::log::info!("exile: a replay is already under way");
+            return;
+        }
+        // Free mode's NPCs and interactables would be hidden here (none are spawned yet).
+        self.emit(SessionEvent::ClientControl { mover: me, allow_move: false });
+        self.emit(SessionEvent::Worldport {
+            map_id: MAP_ID,
+            position: BATTLE_CENTER,
+            orientation: 0.0,
+            needs_ack: true,
+        });
+        self.phase = Phase::Porting;
+    }
+
+    /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
         if self.combat_due.is_some_and(|t| now >= t) {
             self.combat_due = None;
-            let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
-            self.send("combat.start", json!({ "characterId": id, "map": "Map_1_1", "mode": "watch" }));
+            self.start_replay();
         }
+        let me = self.self_guid;
         if self.clear_due.is_some_and(|t| now >= t) {
             self.clear_due = None;
-            let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).collect();
+            let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
             for guid in guids {
                 self.emit(SessionEvent::ObjectDestroyed(guid));
             }
+            // Back to free mode: home; the controls come back on the port's ack.
+            if me.is_some() {
+                self.emit(SessionEvent::Worldport {
+                    map_id: MAP_ID,
+                    position: ORIGIN,
+                    orientation: 0.0,
+                    needs_ack: true,
+                });
+            }
+            self.focus = None;
+            self.phase = Phase::Returning;
         }
     }
 
@@ -377,6 +469,7 @@ impl Bridge {
             "ui.character.list.result" => self.roster_from(data),
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
+                self.focus = data["focusId"].as_str().map(str::to_owned);
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => self.frame(data),
@@ -435,7 +528,8 @@ impl Bridge {
     }
 
     /// Entering the world as roster entry `guid`: the session starts, the login position, and the
-    /// player's own unit. `EXILE_AUTOCOMBAT=1` then asks the runtime for a watched combat.
+    /// player's own unit: free mode (D27). `EXILE_AUTOCOMBAT=1` (unattended tests) starts the replay
+    /// trip by itself after [`AUTOCOMBAT_DELAY`].
     fn enter_world(&mut self, guid: u64) {
         let Some(me) = self.roster.iter().find(|c| c.guid == guid).cloned() else {
             bevy::log::error!("exile: no roster entry {guid}");
@@ -455,12 +549,26 @@ impl Bridge {
             orientation: 0.0,
             needs_ack: false,
         });
+        // The account-data digests a server sends after the login verify: all empty, so every
+        // section settles from this machine's files or the defaults. Without them the sections stay
+        // pending and the key bindings never load (no WASD, mouse turn or Escape).
+        self.emit(SessionEvent::AccountDataMd5([[0u8; 16]; ACCOUNT_DATA_SECTIONS]));
+        self.me = Some(me);
+        self.create_self(ORIGIN);
+        if std::env::var("EXILE_AUTOCOMBAT").as_deref() == Ok("1") {
+            self.combat_due = Some(Instant::now() + AUTOCOMBAT_DELAY);
+        }
+    }
+
+    /// The player's own unit at `pos`: at world entry and again after every worldport.
+    fn create_self(&mut self, pos: [f32; 3]) {
+        let (Some(guid), Some(me)) = (self.self_guid, self.me.clone()) else { return };
         let bytes0 = me.race as u32 | (me.class as u32) << 8 | (me.gender as u32) << 16;
         self.emit(unit_create(
             guid,
             EntityKind::Player,
             50,
-            ORIGIN,
+            pos,
             0.0,
             &[
                 (FIELD_UNIT_HEALTH, 100),
@@ -470,9 +578,6 @@ impl Bridge {
                 (FIELD_UNIT_BYTES_0, bytes0),
             ],
         ));
-        if std::env::var("EXILE_AUTOCOMBAT").as_deref() == Ok("1") {
-            self.combat_due = Some(Instant::now() + AUTOCOMBAT_DELAY);
-        }
     }
 
     /// One `combat.frame`: create the actors not yet shown, walk the rest to their new spot
@@ -488,6 +593,13 @@ impl Bridge {
             let facing = actor["angle"].as_f64().unwrap_or(0.0) as f32;
             let max_life = actor["maxLife"].as_f64().unwrap_or(100.0).max(1.0).ceil() as u32;
             let life = actor["life"].as_f64().unwrap_or(max_life as f64).max(0.0).ceil() as u32;
+            // The combat's creator is played by the player's own body (D28): first seen, it takes
+            // the self guid, so the camera's stock chase follows it.
+            if !self.shown.contains_key(id) && self.focus.as_deref() == Some(id) {
+                if let Some(me) = self.self_guid {
+                    self.shown.insert(id.to_owned(), Shown { guid: me, pos: BATTLE_CENTER, life });
+                }
+            }
             if let Some(shown) = self.shown.get(id) {
                 let (guid, from, old_life) = (shown.guid, shown.pos, shown.life);
                 let moved = (pos[0] - from[0]).hypot(pos[1] - from[1]);
@@ -573,13 +685,13 @@ impl Bridge {
     }
 }
 
-/// DQQ battlefield `(x, y)` (double) → WoW world coordinates around [`ORIGIN`]; the ground height
+/// DQQ battlefield `(x, y)` (double, 0..10) → WoW world coordinates centred on [`BATTLE_CENTER`]; the ground height
 /// is the client's ground clamp's to settle.
 fn to_world(x: f64, y: f64) -> [f32; 3] {
     [
-        ORIGIN[0] + x as f32 * YARDS_PER_UNIT,
-        ORIGIN[1] + y as f32 * YARDS_PER_UNIT,
-        ORIGIN[2],
+        BATTLE_CENTER[0] + (x - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+        BATTLE_CENTER[1] + (y - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+        BATTLE_CENTER[2],
     ]
 }
 

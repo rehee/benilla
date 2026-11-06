@@ -718,6 +718,8 @@ fn drive_loading_screen(
             && !player_settling
             && warm.satisfied()
             && entry_ui_pending.is_none()
+            // Exile of Azeroth (rehee/benilla fork): the screen shows at least a moment.
+            && f64::from(now - screen.active_since) >= exile_min_visible_secs()
         {
             screen.ready_frames += 1;
             if screen.ready_frames >= CLEAR_AFTER_READY_FRAMES {
@@ -1325,4 +1327,18 @@ mod tests {
         world.run_system_once(release_interface_on_arrival).unwrap();
         assert!(!world.resource::<LoadingScreen>().hides_interface());
     }
+}
+
+/// Exile of Azeroth (rehee/benilla fork): in Exile mode (`EXILE_RUNTIME` set) every loading screen
+/// stays up at least this long, so the switch between free mode and a combat is seen (D28); 0
+/// otherwise, the stock behaviour.
+fn exile_min_visible_secs() -> f64 {
+    static SECS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SECS.get_or_init(|| {
+        if std::env::var("EXILE_RUNTIME").is_ok_and(|v| !v.trim().is_empty()) {
+            0.5
+        } else {
+            0.0
+        }
+    })
 }
