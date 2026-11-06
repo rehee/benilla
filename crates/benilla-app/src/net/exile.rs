@@ -49,7 +49,7 @@ const ORIGIN: [f32; 3] = [-8949.95, -132.49, 83.6];
 /// centred here, one DQQ unit [`YARDS_PER_UNIT`] yards.
 const BATTLE_CENTER: [f32; 3] = [-8934.95, -117.49, 83.6];
 const DQQ_FIELD_HALF: f64 = 5.0;
-const YARDS_PER_UNIT: f32 = 3.0;
+const YARDS_PER_UNIT: f32 = 2.0;
 
 
 /// Is Exile mode on? `EXILE_RUNTIME` names the runtime's WebSocket.
@@ -169,6 +169,11 @@ struct Shown {
 /// on into the next segment, the walk cycle running on unbroken. The frames are shown this many
 /// frames late, so each segment's path is known whole when it starts.
 const SEGMENT_FRAMES: usize = 5;
+/// The walk speeds units are created with. The client picks Run over Walk above twice the walk
+/// speed, and DQQ's units cover about a yard a second, so in combat the walk speed is set so low
+/// that every walk shows the run (user, 2026-11-06); free mode keeps the stock 2.5.
+const COMBAT_WALK_SPEED: f32 = 0.05;
+const FREE_WALK_SPEED: f32 = 2.5;
 /// One DQQ tick, milliseconds (30 ticks/s).
 const TICK_MS: f32 = 1000.0 / 30.0;
 /// A segment shorter than this (yards) is no walk.
@@ -441,13 +446,13 @@ impl Bridge {
                 Phase::Porting => {
                     // A worldport clears the world; the player's own unit comes again, as a server
                     // re-sends it after the port.
-                    self.create_self(self.ground.on_ground(BATTLE_CENTER));
+                    self.create_self(self.ground.on_ground(BATTLE_CENTER), COMBAT_WALK_SPEED);
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
                     self.send("combat.replay", json!({ "characterId": id, "mode": "watch" }));
                     self.phase = Phase::Combat;
                 }
                 Phase::Returning => {
-                    self.create_self(ORIGIN);
+                    self.create_self(ORIGIN, FREE_WALK_SPEED);
                     if let Some(me) = self.self_guid {
                         self.emit(SessionEvent::ClientControl { mover: me, allow_move: true });
                     }
@@ -669,17 +674,18 @@ impl Bridge {
         // pending and the key bindings never load (no WASD, mouse turn or Escape).
         self.emit(SessionEvent::AccountDataMd5([[0u8; 16]; ACCOUNT_DATA_SECTIONS]));
         self.me = Some(me);
-        self.create_self(ORIGIN);
+        self.create_self(ORIGIN, FREE_WALK_SPEED);
         if std::env::var("EXILE_AUTOCOMBAT").as_deref() == Ok("1") {
             self.combat_due = Some(Instant::now() + AUTOCOMBAT_DELAY);
         }
     }
 
     /// The player's own unit at `pos`: at world entry and again after every worldport.
-    fn create_self(&mut self, pos: [f32; 3]) {
+    fn create_self(&mut self, pos: [f32; 3], walk: f32) {
         let (Some(guid), Some(me)) = (self.self_guid, self.me.clone()) else { return };
         let bytes0 = me.race as u32 | (me.class as u32) << 8 | (me.gender as u32) << 16;
         self.emit(unit_create(
+            walk,
             guid,
             EntityKind::Player,
             50,
@@ -856,6 +862,7 @@ impl Bridge {
                     .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
                     .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
                 self.emit(unit_create(
+                    COMBAT_WALK_SPEED,
                     guid,
                     EntityKind::Unit,
                     display,
@@ -924,6 +931,7 @@ fn angle_gap(a: f32, b: f32) -> f32 {
 /// A unit or player create, as the update stream carries it: `OBJECT_FIELD_TYPE`, the display
 /// ids and the given fields.
 fn unit_create(
+    walk: f32,
     guid: u64,
     kind: EntityKind,
     display: u32,
@@ -947,7 +955,7 @@ fn unit_create(
         orientation,
         scale: 1.0,
         speeds: Some(MoveSpeeds {
-            walk: 2.5,
+            walk,
             run: 7.0,
             run_back: 4.5,
             swim: 4.72,
