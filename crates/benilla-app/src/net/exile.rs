@@ -331,6 +331,8 @@ struct Bridge {
     ground: Ground,
     /// The recording the next replay trip plays (`None`: the character's latest).
     replay_id: Option<String>,
+    /// Or the recording file it plays (`replays/`, runtime `ReplayFiles`).
+    replay_file: Option<String>,
     /// Frames shown in this combat, and the moves and turns sent (the once-a-second trace).
     frames: u64,
     moves: u64,
@@ -377,6 +379,7 @@ impl Bridge {
             spline_id: 0,
             ground: Ground::load(BATTLE_CENTER),
             replay_id: None,
+            replay_file: None,
             frames: 0,
             moves: 0,
             turns: 0,
@@ -470,9 +473,10 @@ impl Bridge {
                     self.create_self(self.ground.on_ground(BATTLE_CENTER), COMBAT_WALK_SPEED);
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
                     let replay = self.replay_id.take();
+                    let file = self.replay_file.take();
                     self.send(
                         "combat.replay",
-                        json!({ "replayId": replay, "characterId": id, "mode": "watch" }),
+                        json!({ "replayId": replay, "file": file, "characterId": id, "mode": "watch" }),
                     );
                     self.phase = Phase::Combat;
                 }
@@ -521,6 +525,25 @@ impl Bridge {
                     return;
                 }
                 self.replay_id = parts.next().filter(|id| !id.is_empty()).map(str::to_owned);
+                self.replay_file = None;
+                self.start_replay();
+            }
+            // Export one recording to a file (`ui.replay.export`, the DQQ export format).
+            "replay.export" => {
+                let id = parts.next().unwrap_or_default();
+                self.send("ui.replay.export", json!({ "replayId": id }));
+            }
+            // The recording files (`ui.replay.files`).
+            "replay.files" => self.send("ui.replay.files", Value::Null),
+            // Play a recording file.
+            "replay.file" => {
+                if self.phase != Phase::Free {
+                    self.addon_say("error;A replay is already playing.");
+                    return;
+                }
+                let Some(file) = parts.next().filter(|f| !f.is_empty()) else { return };
+                self.replay_file = Some(file.to_owned());
+                self.replay_id = None;
                 self.start_replay();
             }
             other => bevy::log::warn!("exile: unknown addon request {other:?}"),
@@ -546,29 +569,30 @@ impl Bridge {
     /// `ui.replay.list.result` for the addon: `replay.begin;<n>`, one `replay;<id>;<label>` each
     /// (at most [`ADDON_REPLAYS`]), then `replay.end`.
     fn replays_to_addon(&mut self, list: &Value) {
+        self.list_to_addon("replay", "id", list);
+    }
+
+    /// `ui.replay.files.result` for the addon: `file.begin;<n>`, `file;<name>;<label>`, `file.end`.
+    fn files_to_addon(&mut self, list: &Value) {
+        self.list_to_addon("file", "file", list);
+    }
+
+    fn list_to_addon(&mut self, verb: &str, key: &str, list: &Value) {
         let all = list.as_array().cloned().unwrap_or_default();
-        bevy::log::info!("exile: {} recordings for the addon", all.len());
-        let shown: Vec<&Value> = all.iter().take(ADDON_REPLAYS).collect();
-        self.addon_say(&format!("replay.begin;{}", all.len()));
-        for r in shown {
-            let id = r["id"].as_str().unwrap_or_default();
-            // "2026-11-06T19:50:08…" → "11-06 19:50".
-            let when = r["playTime"]
-                .as_str()
-                .and_then(|t| t.get(5..16))
-                .map(|t| t.replace('T', " "))
-                .unwrap_or_default();
-            let label = format!(
-                "{when}  {}  {}s  XP {}  dmg {}",
-                r["result"].as_str().unwrap_or("?"),
-                r["ticks"].as_u64().unwrap_or(0) / 30,
-                r["experience"].as_i64().unwrap_or(0),
-                r["totalDamage"].as_str().unwrap_or("0"),
-            )
-            .replace([';', '|'], " ");
-            self.addon_say(&format!("replay;{id};{label}"));
+        bevy::log::info!("exile: {} {verb} entries for the addon", all.len());
+        self.addon_say(&format!("{verb}.begin;{}", all.len()));
+        for r in all.iter().take(ADDON_REPLAYS) {
+            let key = r[key].as_str().unwrap_or_default().replace([';', '|'], " ");
+            let label = if verb == "file" {
+                // The file's own name leads: "dqq-replay-c6bc687b.txt" shows as "c6bc687b".
+                let short = key.trim_start_matches("dqq-replay-").trim_end_matches(".txt");
+                format!("{short}  {}", replay_label(r))
+            } else {
+                replay_label(r)
+            };
+            self.addon_say(&format!("{verb};{key};{label}"));
         }
-        self.addon_say("replay.end");
+        self.addon_say(&format!("{verb}.end"));
     }
 
     /// D28: control taken and the port to the battlefield, whose loading screen is the "bar"; the
@@ -669,6 +693,12 @@ impl Bridge {
             "hello" => bevy::log::info!("exile: runtime says hello {data}"),
             "ui.character.list.result" => self.roster_from(data),
             "ui.replay.list.result" => self.replays_to_addon(data),
+            "ui.replay.files.result" => self.files_to_addon(data),
+            "ui.replay.export.result" => {
+                let file = data["file"].as_str().unwrap_or_default().replace([';', '|'], " ");
+                bevy::log::info!("exile: exported {}", data["path"]);
+                self.addon_say(&format!("exported;{file}"));
+            }
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
@@ -1026,6 +1056,33 @@ impl Bridge {
             }));
         }
     }
+}
+
+/// A recording's one-line label for the addon, led by whose combat it is and the recording's own
+/// name when it has one: "1a  11-06 19:50  Win  29 ticks  XP 160  dmg 11692".
+fn replay_label(r: &Value) -> String {
+    let who = [r["character"].as_str(), r["name"].as_str()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    // "2026-11-06T19:50:08…" → "11-06 19:50".
+    let when = r["playTime"]
+        .as_str()
+        .and_then(|t| t.get(5..16))
+        .map(|t| t.replace('T', " "))
+        .unwrap_or_default();
+    format!(
+        "{who}{}{when}  {}  {} ticks  XP {}  dmg {}",
+        if who.is_empty() { "" } else { "  " },
+        r["result"].as_str().unwrap_or("?"),
+        r["ticks"].as_u64().unwrap_or(0),
+        r["experience"].as_i64().unwrap_or(0),
+        r["totalDamage"].as_str().unwrap_or("0"),
+    )
+    .replace([';', '|'], " ")
 }
 
 /// The WoW facing (radians, 0 = +x north, counter-clockwise, in `[0, 2π)`) of a world-space
