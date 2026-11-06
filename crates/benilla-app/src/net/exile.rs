@@ -10,7 +10,7 @@
 //!
 //! Exile 模式：不连 WoW 服务器，由 Exile Runtime 经本机 WebSocket 驱动客户端（本仓库为 rehee/benilla 分支）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -158,7 +158,21 @@ struct Shown {
     life: u32,
     /// The facing last shown, WoW radians.
     facing: f32,
+    /// The frame the walk segment under way ends on; none runs once [`Bridge::frames`] reaches it.
+    walk_until: u64,
+    /// Where DQQ had the actor last frame, and its `moving` flag then (the flag census).
+    last_dqq: [f32; 3],
 }
+
+/// A walk is shown in segments of this many frames (user rule, 2026-11-06): a walk that starts
+/// plays at least this long; at the segment's end a still unit stops, a moving one goes straight
+/// on into the next segment, the walk cycle running on unbroken. The frames are shown this many
+/// frames late, so each segment's path is known whole when it starts.
+const SEGMENT_FRAMES: usize = 5;
+/// One DQQ tick, milliseconds (30 ticks/s).
+const TICK_MS: f32 = 1000.0 / 30.0;
+/// A segment shorter than this (yards) is no walk.
+const WALK_MIN: f32 = 0.05;
 
 /// The terrain under the battlefield, read from the install's ADT tiles once, so every actor
 /// stands on the ground: a creature's height is the server's (here, ours) to give, not the
@@ -306,6 +320,13 @@ struct Bridge {
     frames: u64,
     moves: u64,
     turns: u64,
+    /// The last [`SEGMENT_FRAMES`] frames received, not yet shown: the lookahead of the walk
+    /// segments.
+    pending: VecDeque<Value>,
+    /// The `moving` flag census: (flag set, moved), (flag set, still), (flag clear, moved).
+    flag_moved: u64,
+    flag_still: u64,
+    noflag_moved: u64,
 }
 
 impl Bridge {
@@ -343,6 +364,10 @@ impl Bridge {
             frames: 0,
             moves: 0,
             turns: 0,
+            pending: VecDeque::new(),
+            flag_moved: 0,
+            flag_still: 0,
+            noflag_moved: 0,
         }
     }
 
@@ -535,11 +560,30 @@ impl Bridge {
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
+                (self.flag_moved, self.flag_still, self.noflag_moved) = (0, 0, 0);
+                self.pending.clear();
                 self.focus = data["focusId"].as_str().map(str::to_owned);
                 bevy::log::info!("exile: combat begins {data}");
             }
-            "combat.frame" => self.frame(data),
+            "combat.frame" => {
+                self.pending.push_back(data.clone());
+                while self.pending.len() > SEGMENT_FRAMES {
+                    if let Some(f) = self.pending.pop_front() {
+                        self.frame(&f);
+                    }
+                }
+            }
             "combat.end" => {
+                // The frames still held back play out now, their walks shortened to what is left.
+                while let Some(f) = self.pending.pop_front() {
+                    self.frame(&f);
+                }
+                bevy::log::info!(
+                    "exile: moving flag census: set+moved {}, set+still {}, clear+moved {}",
+                    self.flag_moved,
+                    self.flag_still,
+                    self.noflag_moved
+                );
                 bevy::log::info!(
                     "exile: combat ends after {} frames, {} moves, {} turns sent {data}",
                     self.frames,
@@ -688,54 +732,103 @@ impl Bridge {
             if !self.shown.contains_key(id) && self.focus.as_deref() == Some(id) {
                 if let Some(me) = self.self_guid {
                     let from = self.ground.on_ground(BATTLE_CENTER);
-                    self.shown.insert(id.to_owned(), Shown { guid: me, pos: from, life, facing: 0.0 });
+                    self.shown.insert(id.to_owned(), Shown {
+                            guid: me,
+                            pos: from,
+                            life,
+                            facing: 0.0,
+                            walk_until: 0,
+                            last_dqq: pos,
+                        });
                 }
             }
             if let Some(shown) = self.shown.get(id) {
                 let (guid, from, old_life, old_facing) = (shown.guid, shown.pos, shown.life, shown.facing);
-                let (dx, dy) = (pos[0] - from[0], pos[1] - from[1]);
-                let moved = dx.hypot(dy);
+                let (walk_until, last_dqq) = (shown.walk_until, shown.last_dqq);
+                // The flag census: does DQQ's `moving` agree with the steps?
+                let stepped = (pos[0] - last_dqq[0]).hypot(pos[1] - last_dqq[1]) > 0.001;
+                match (actor["moving"].as_bool() == Some(true), stepped) {
+                    (true, true) => self.flag_moved += 1,
+                    (true, false) => self.flag_still += 1,
+                    (false, true) => self.noflag_moved += 1,
+                    _ => {}
+                }
                 let mut facing = old_facing;
-                if moved > 0.01 {
-                    // A walk: the unit faces its way (`MonsterMoveFacing::None`).
-                    facing = wow_facing(dx, dy);
-                    self.spline_id = self.spline_id.wrapping_add(1);
-                    self.moves += 1;
-                    self.emit(SessionEvent::MonsterMove {
-                        guid,
-                        transport: None,
-                        start: from,
-                        spline_id: self.spline_id,
-                        // A path starts at the wire's start point, as the packet decodes it: a
-                        // one-point path installs no spline (`monster_move_spline`), no walk.
-                        path: vec![from, pos],
-                        facing: MonsterMoveFacing::None,
-                        stop: false,
-                        duration_ms: 40,
-                        flying: false,
-                        run_mode: true,
-                    });
-                } else if let Some(t) = target {
-                    // Standing: turn to the target when it is off by more than a few degrees.
-                    let (tx, ty) = (t[0] - pos[0], t[1] - pos[1]);
-                    if tx.hypot(ty) > 0.05 {
-                        let want = wow_facing(tx, ty);
-                        if angle_gap(want, old_facing) > 0.1 {
-                            facing = want;
-                            self.spline_id = self.spline_id.wrapping_add(1);
-                            self.turns += 1;
-                            self.emit(SessionEvent::MonsterMove {
-                                guid,
-                                transport: None,
-                                start: from,
-                                spline_id: self.spline_id,
-                                path: Vec::new(),
-                                facing: MonsterMoveFacing::Angle(want),
-                                stop: true,
-                                duration_ms: 0,
-                                flying: false,
-                                run_mode: false,
-                            });
+                let mut shown_at = from;
+                let mut until = walk_until;
+                if self.frames >= walk_until {
+                    // No segment under way: the next frames' path decides walk or stand.
+                    let mut path = vec![from];
+                    for f in &self.pending {
+                        let Some(next) = f["actors"]
+                            .as_array()
+                            .and_then(|a| a.iter().find(|a| a["id"].as_str() == Some(id)))
+                        else {
+                            break;
+                        };
+                        let p = self.to_world(
+                            next["x"].as_f64().unwrap_or(0.0),
+                            next["y"].as_f64().unwrap_or(0.0),
+                        );
+                        path.push(p);
+                    }
+                    // This frame's own spot leads when no lookahead is left (the combat's end).
+                    if path.len() == 1 {
+                        path.push(pos);
+                    }
+                    let steps = path.len() - 1;
+                    let length: f32 = path
+                        .windows(2)
+                        .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+                        .sum();
+                    let end = path[steps];
+                    if length > WALK_MIN {
+                        // A segment: the whole stretch at its average speed, the unit facing its
+                        // way. Back to back, one segment's end is the next one's start, so the
+                        // walk runs on without restarting.
+                        path.dedup_by(|b, a| (b[0] - a[0]).hypot(b[1] - a[1]) < 0.001);
+                        let last = path[path.len() - 2];
+                        facing = wow_facing(end[0] - last[0], end[1] - last[1]);
+                        self.spline_id = self.spline_id.wrapping_add(1);
+                        self.moves += 1;
+                        self.emit(SessionEvent::MonsterMove {
+                            guid,
+                            transport: None,
+                            start: from,
+                            spline_id: self.spline_id,
+                            // A path starts at the wire's start point, as the packet decodes it:
+                            // a one-point path installs no spline (`monster_move_spline`).
+                            path,
+                            facing: MonsterMoveFacing::None,
+                            stop: false,
+                            duration_ms: (steps as f32 * TICK_MS).round() as u32,
+                            flying: false,
+                            run_mode: true,
+                        });
+                        shown_at = end;
+                        until = self.frames + steps as u64;
+                    } else if let Some(t) = target {
+                        // Standing: turn to the target when it is off by more than a few degrees.
+                        let (tx, ty) = (t[0] - from[0], t[1] - from[1]);
+                        if tx.hypot(ty) > 0.05 {
+                            let want = wow_facing(tx, ty);
+                            if angle_gap(want, old_facing) > 0.1 {
+                                facing = want;
+                                self.spline_id = self.spline_id.wrapping_add(1);
+                                self.turns += 1;
+                                self.emit(SessionEvent::MonsterMove {
+                                    guid,
+                                    transport: None,
+                                    start: from,
+                                    spline_id: self.spline_id,
+                                    path: Vec::new(),
+                                    facing: MonsterMoveFacing::Angle(want),
+                                    stop: true,
+                                    duration_ms: 0,
+                                    flying: false,
+                                    run_mode: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -746,11 +839,11 @@ impl Bridge {
                     });
                 }
                 if let Some(s) = self.shown.get_mut(id) {
-                    if moved > 0.01 {
-                        s.pos = pos;
-                    }
+                    s.pos = shown_at;
                     s.life = life;
                     s.facing = facing;
+                    s.walk_until = until;
+                    s.last_dqq = pos;
                 }
             } else {
                 let guid = self.next_creature;
@@ -778,7 +871,10 @@ impl Bridge {
                         ),
                     ],
                 ));
-                self.shown.insert(id.to_owned(), Shown { guid, pos, life, facing });
+                self.shown.insert(
+                    id.to_owned(),
+                    Shown { guid, pos, life, facing, walk_until: 0, last_dqq: pos },
+                );
             }
         }
         let gone: Vec<String> = self.shown.keys().filter(|k| !seen.contains(k)).cloned().collect();
