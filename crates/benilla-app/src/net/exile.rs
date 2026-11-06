@@ -20,7 +20,10 @@ use benilla_protocol::field::{
     FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
     FIELD_UNIT_MAXHEALTH,
 };
-use benilla_protocol::messages::{AttackerState, Billing, ObjectType, ACCOUNT_DATA_SECTIONS};
+use benilla_protocol::messages::{
+    AttackerState, Billing, ChatMessage, ObjectType, ACCOUNT_DATA_SECTIONS, CHAT_MSG_PARTY,
+    LANGUAGE_ADDON,
+};
 use benilla_protocol::{
     CharEnumItem, Character, EntityKind, LoginStage, MonsterMoveFacing, MoveSpeeds, ObjectFields,
     RealmInfo, RosterCause, SessionEvent,
@@ -290,6 +293,11 @@ impl ModelBook {
     }
 }
 
+/// The Exile UI addon's message prefix (`addons/ExileUI`).
+const ADDON_PREFIX: &str = "EXILE";
+/// The most recordings listed to the addon.
+const ADDON_REPLAYS: usize = 10;
+
 /// A display every install has: the kobold (`Creature\\Kobold`), when a key finds nothing.
 const FALLBACK_DISPLAY: u32 = 30;
 
@@ -321,6 +329,8 @@ struct Bridge {
     clear_due: Option<Instant>,
     spline_id: u32,
     ground: Ground,
+    /// The recording the next replay trip plays (`None`: the character's latest).
+    replay_id: Option<String>,
     /// Frames shown in this combat, and the moves and turns sent (the once-a-second trace).
     frames: u64,
     moves: u64,
@@ -366,6 +376,7 @@ impl Bridge {
             clear_due: None,
             spline_id: 0,
             ground: Ground::load(BATTLE_CENTER),
+            replay_id: None,
             frames: 0,
             moves: 0,
             turns: 0,
@@ -428,8 +439,10 @@ impl Bridge {
                         return;
                     }
                 },
-                default(Duration::from_millis(50)) => self.timers(),
+                default(Duration::from_millis(20)) => {}
             }
+            // Every pass, so a steady stream of messages never starves them.
+            self.timers();
         }
     }
 
@@ -441,6 +454,14 @@ impl Bridge {
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
                 self.start_replay();
             }
+            // Names: the player's own (addon lines name it as their sender); any other is unknown.
+            ClientCommand::NameQuery { guid } => self.answer_name(*guid),
+            // The Exile UI addon's requests (`docs/bridge-protocol.md` §4).
+            ClientCommand::AddonMessage { text, .. } => {
+                if let Some(msg) = text.strip_prefix(ADDON_PREFIX).and_then(|t| t.strip_prefix('\t')) {
+                    self.on_addon(msg);
+                }
+            }
             // The worldport's load is done.
             ClientCommand::WorldportAck => match self.phase {
                 Phase::Porting => {
@@ -448,7 +469,11 @@ impl Bridge {
                     // re-sends it after the port.
                     self.create_self(self.ground.on_ground(BATTLE_CENTER), COMBAT_WALK_SPEED);
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
-                    self.send("combat.replay", json!({ "characterId": id, "mode": "watch" }));
+                    let replay = self.replay_id.take();
+                    self.send(
+                        "combat.replay",
+                        json!({ "replayId": replay, "characterId": id, "mode": "watch" }),
+                    );
                     self.phase = Phase::Combat;
                 }
                 Phase::Returning => {
@@ -463,6 +488,87 @@ impl Bridge {
             },
             _ => {}
         }
+    }
+
+    /// `SMSG_NAME_QUERY_RESPONSE`'s stand-in: our own name, an empty one for anyone else.
+    fn answer_name(&mut self, guid: u64) {
+        let me = self.me.clone().filter(|_| Some(guid) == self.self_guid);
+        self.emit(SessionEvent::PlayerName {
+            guid,
+            name: me.as_ref().map(|m| m.name.clone()).unwrap_or_default(),
+            race: me.as_ref().map_or(0, |m| u32::from(m.race)),
+            gender: me.as_ref().map_or(0, |m| u32::from(m.gender)),
+            class: me.as_ref().map_or(0, |m| u32::from(m.class)),
+        });
+    }
+
+    /// One addon request, `verb;arg;…` (`;` because `|` is the chat escape character).
+    fn on_addon(&mut self, msg: &str) {
+        bevy::log::info!("exile: addon says {msg:?}");
+        let mut parts = msg.split(';');
+        match parts.next().unwrap_or_default() {
+            // The round trip's test: answered by the bridge itself.
+            "ping" => self.addon_say(&format!("pong;{}", parts.next().unwrap_or_default())),
+            // The character's recordings, newest first: asked of the runtime (`ui.replay.list`).
+            "replay.list" => {
+                let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
+                self.send("ui.replay.list", json!({ "characterId": id }));
+            }
+            // Play one recording (an empty id: the latest).
+            "replay.play" => {
+                if self.phase != Phase::Free {
+                    self.addon_say("error;A replay is already playing.");
+                    return;
+                }
+                self.replay_id = parts.next().filter(|id| !id.is_empty()).map(str::to_owned);
+                self.start_replay();
+            }
+            other => bevy::log::warn!("exile: unknown addon request {other:?}"),
+        }
+    }
+
+    /// A line to the Exile UI addon: an addon message (`LANG_ADDON`) on the party lane, sent by
+    /// the player (`CHAT_MSG_ADDON` waits on its sender's name; [`Self::answer_name`]).
+    fn addon_say(&mut self, msg: &str) {
+        bevy::log::debug!("exile: to the addon {msg:?}");
+        self.emit(SessionEvent::Chat(ChatMessage {
+            chat_type: CHAT_MSG_PARTY,
+            language: LANGUAGE_ADDON,
+            sender_guid: self.self_guid.unwrap_or(0),
+            target_guid: 0,
+            sender_name: None,
+            channel: None,
+            text: format!("{ADDON_PREFIX}\t{msg}"),
+            chat_tag: 0,
+        }));
+    }
+
+    /// `ui.replay.list.result` for the addon: `replay.begin;<n>`, one `replay;<id>;<label>` each
+    /// (at most [`ADDON_REPLAYS`]), then `replay.end`.
+    fn replays_to_addon(&mut self, list: &Value) {
+        let all = list.as_array().cloned().unwrap_or_default();
+        bevy::log::info!("exile: {} recordings for the addon", all.len());
+        let shown: Vec<&Value> = all.iter().take(ADDON_REPLAYS).collect();
+        self.addon_say(&format!("replay.begin;{}", all.len()));
+        for r in shown {
+            let id = r["id"].as_str().unwrap_or_default();
+            // "2026-11-06T19:50:08…" → "11-06 19:50".
+            let when = r["playTime"]
+                .as_str()
+                .and_then(|t| t.get(5..16))
+                .map(|t| t.replace('T', " "))
+                .unwrap_or_default();
+            let label = format!(
+                "{when}  {}  {}s  XP {}  dmg {}",
+                r["result"].as_str().unwrap_or("?"),
+                r["ticks"].as_u64().unwrap_or(0) / 30,
+                r["experience"].as_i64().unwrap_or(0),
+                r["totalDamage"].as_str().unwrap_or("0"),
+            )
+            .replace([';', '|'], " ");
+            self.addon_say(&format!("replay;{id};{label}"));
+        }
+        self.addon_say("replay.end");
     }
 
     /// D28: control taken and the port to the battlefield, whose loading screen is the "bar"; the
@@ -562,6 +668,7 @@ impl Bridge {
         match kind {
             "hello" => bevy::log::info!("exile: runtime says hello {data}"),
             "ui.character.list.result" => self.roster_from(data),
+            "ui.replay.list.result" => self.replays_to_addon(data),
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
@@ -598,7 +705,11 @@ impl Bridge {
                 self.combat = None;
                 self.clear_due = Some(Instant::now() + CLEAR_DELAY);
             }
-            "error" => bevy::log::error!("exile: runtime error {data}"),
+            "error" => {
+                bevy::log::error!("exile: runtime error {data}");
+                let text = data["message"].as_str().unwrap_or("runtime error").replace([';', '|'], " ");
+                self.addon_say(&format!("error;{text}"));
+            }
             _ => {}
         }
     }
@@ -674,6 +785,7 @@ impl Bridge {
         // pending and the key bindings never load (no WASD, mouse turn or Escape).
         self.emit(SessionEvent::AccountDataMd5([[0u8; 16]; ACCOUNT_DATA_SECTIONS]));
         self.me = Some(me);
+        self.answer_name(guid);
         self.create_self(ORIGIN, FREE_WALK_SPEED);
         if std::env::var("EXILE_AUTOCOMBAT").as_deref() == Ok("1") {
             self.combat_due = Some(Instant::now() + AUTOCOMBAT_DELAY);

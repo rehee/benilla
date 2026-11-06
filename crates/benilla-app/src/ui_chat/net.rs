@@ -37,6 +37,13 @@ pub(super) fn register(app: &mut App) {
 /// every leave of the world sets it again).
 fn latch_on_connect(In(ev): In<SessionEvent>, log: Res<ChatLog>) {
     if let SessionEvent::Connected { .. } = ev {
+        // Exile mode: the world-enter cascade's release never meets this latch (the runtime's
+        // session sends its world in one burst), and a set latch holds every chat and addon line
+        // back for good; nothing is said before the UI is up, so there is nothing to hold.
+        if crate::net::exile_mode() {
+            debug!("chat: Exile mode, no display latch at the session start");
+            return;
+        }
         log.latch();
     }
 }
