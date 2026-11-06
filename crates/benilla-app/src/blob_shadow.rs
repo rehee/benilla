@@ -55,8 +55,6 @@ const SHADOW_TEXTURE: &str = "mpq://textures/shadowblob.blp";
 const BOX_CLAMP: f32 = 5.0;
 /// The reference's degenerate-box epsilon (`[0x8029d4]`).
 const DEGENERATE_EPS: f32 = 2.384e-7;
-/// Exile mode's disc darkness, the alpha of its black at the ramp's full weight.
-const EXILE_SHADOW_OPACITY: f32 = 0.5;
 
 /// One unit's shadow record, a top-level entity despawned with its owner.
 #[derive(Component)]
@@ -490,23 +488,6 @@ fn push_shadows(
     let Ok(cam) = cam.single() else { return };
     for (entity, key, verts) in &shadows {
         if verts.0.is_empty() {
-            continue;
-        }
-        // Exile mode: the plain dark disc the design asks for (a round shadow under every
-        // unit, clearly visible), alpha-blended black through the texture's binary alpha disc,
-        // instead of the reference's faint multiply.
-        if crate::net::exile_mode() {
-            let mut batch = draw
-                .batch(cam, assets.texture.id())
-                .alpha()
-                .anchored(key.feet)
-                .rung(Rung::SHADOW_SORT, settings.decal_raster())
-                .owner(entity);
-            batch.extend(verts.0.iter().map(|v| EffectVertex {
-                color: [0.0, 0.0, 0.0, v.color[3] * EXILE_SHADOW_OPACITY],
-                ..*v
-            }));
-            batch.tris();
             continue;
         }
         // Unlit: the scene light is already in the ground it multiplies.
