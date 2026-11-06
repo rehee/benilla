@@ -49,6 +49,9 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # Thread-to-ECS channels: crossbeam's `Receiver` is `Sync`, so it is a resource without a mutex.
 crossbeam-channel = "0.5"
+# Exile of Azeroth (rehee/benilla fork): the runtime link (`net/exile.rs`), plain loopback ws only.
+serde_json = "1"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 benilla-assets = { path = "../benilla-assets", default-features = false }
 benilla-formats = { path = "../benilla-formats", default-features = false }
 benilla-protocol = { path = "../benilla-protocol" }

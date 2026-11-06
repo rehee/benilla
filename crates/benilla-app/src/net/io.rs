@@ -274,6 +274,13 @@ pub(super) struct NetHandles {
 
 /// Spawns the read thread with its park and cycle loop, and the one long-lived write thread.
 pub(super) fn spawn_net(connect: bool) -> NetHandles {
+    // Exile of Azeroth (rehee/benilla fork): with `EXILE_RUNTIME` set the runtime serves the
+    // session in place of realmd and the world server (`net/exile.rs`).
+    if connect {
+        if let Some(url) = super::exile::runtime_url() {
+            return super::exile::spawn(url);
+        }
+    }
     // The outbound opcode trace (tag `out`), armed before any thread can send.
     if benilla_assets::trace::enabled_for("out") {
         benilla_protocol::observe_sends(wire_trace::trace_out);
