@@ -22,6 +22,25 @@ use benilla_world::schedule::WorldStage;
 mod apply;
 // Exile of Azeroth: the runtime-driven session (rehee/benilla fork).
 mod exile;
+
+/// Exile of Azeroth mode (`EXILE_RUNTIME` set): the client is driven by the Exile Runtime.
+pub(crate) fn exile_mode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| exile::runtime_url().is_some())
+}
+
+/// Exile mode's combat replay is on screen (D29): the player watches, the camera is theirs alone.
+static EXILE_SPECTATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a combat replay is being watched: the camera then never returns behind the body on its
+/// own, and a right-drag orbits like a left-drag instead of turning the body.
+pub(crate) fn exile_spectating() -> bool {
+    EXILE_SPECTATING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_exile_spectating(on: bool) {
+    EXILE_SPECTATING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 mod game_time;
 pub(crate) mod handlers;
 pub(crate) mod io;

@@ -42,6 +42,8 @@ const FACTION_HOSTILE: u32 = 14;
 
 /// Free mode's spot: Northshire, the client's own boot anchor, map 0 (Eastern Kingdoms).
 const MAP_ID: u32 = 0;
+/// Map 0's directory name under `World\\Maps`.
+const MAP_NAME: &str = "Azeroth";
 const ORIGIN: [f32; 3] = [-8949.95, -132.49, 83.6];
 /// The battlefield (for now one open field in Northshire, architecture §5.2): DQQ's 10×10 field is
 /// centred here, one DQQ unit [`YARDS_PER_UNIT`] yards.
@@ -154,6 +156,48 @@ struct Shown {
     guid: u64,
     pos: [f32; 3],
     life: u32,
+    /// The facing last shown, WoW radians.
+    facing: f32,
+}
+
+/// The terrain under the battlefield, read from the install's ADT tiles once, so every actor
+/// stands on the ground: a creature's height is the server's (here, ours) to give, not the
+/// client's to settle.
+struct Ground {
+    tiles: Vec<benilla_formats::TileMesh>,
+}
+
+impl Ground {
+    fn load(around: [f32; 3]) -> Self {
+        let tiles = benilla_formats::wow_data()
+            .and_then(|data| benilla_formats::open_chain(&data).ok())
+            .and_then(|mut chain| {
+                benilla_formats::load_tiles_around(&mut chain, MAP_NAME, around[0], around[1], 1).ok()
+            })
+            .map(|v| v.into_iter().map(|(_, mesh)| mesh).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let ground = Self { tiles };
+        bevy::log::info!(
+            "exile: ground {} tiles, battlefield centre z {:.2} (configured {:.2})",
+            ground.tiles.len(),
+            ground.z(around[0], around[1], around[2]),
+            around[2]
+        );
+        ground
+    }
+
+    /// The terrain height at `(x, y)`; `fallback` off the loaded tiles or in a hole.
+    fn z(&self, x: f32, y: f32, fallback: f32) -> f32 {
+        self.tiles
+            .iter()
+            .find_map(|t| benilla_formats::terrain_height_at(&t.chunks, [x, y, fallback]))
+            .unwrap_or(fallback)
+    }
+
+    /// `p` put on the ground.
+    fn on_ground(&self, p: [f32; 3]) -> [f32; 3] {
+        [p[0], p[1], self.z(p[0], p[1], p[2])]
+    }
 }
 
 /// How long after entering the world the auto combat starts: the entry load must have drained,
@@ -257,6 +301,11 @@ struct Bridge {
     combat_due: Option<Instant>,
     clear_due: Option<Instant>,
     spline_id: u32,
+    ground: Ground,
+    /// Frames shown in this combat, and the moves and turns sent (the once-a-second trace).
+    frames: u64,
+    moves: u64,
+    turns: u64,
 }
 
 impl Bridge {
@@ -290,7 +339,21 @@ impl Bridge {
             combat_due: None,
             clear_due: None,
             spline_id: 0,
+            ground: Ground::load(BATTLE_CENTER),
+            frames: 0,
+            moves: 0,
+            turns: 0,
         }
+    }
+
+    /// DQQ battlefield `(x, y)` (double, 0..10) → WoW world coordinates centred on
+    /// [`BATTLE_CENTER`], standing on the terrain there.
+    fn to_world(&self, x: f64, y: f64) -> [f32; 3] {
+        self.ground.on_ground([
+            BATTLE_CENTER[0] + (x - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+            BATTLE_CENTER[1] + (y - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+            BATTLE_CENTER[2],
+        ])
     }
 
     fn emit(&self, ev: SessionEvent) -> bool {
@@ -353,7 +416,7 @@ impl Bridge {
                 Phase::Porting => {
                     // A worldport clears the world; the player's own unit comes again, as a server
                     // re-sends it after the port.
-                    self.create_self(BATTLE_CENTER);
+                    self.create_self(self.ground.on_ground(BATTLE_CENTER));
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
                     self.send("combat.replay", json!({ "characterId": id, "mode": "watch" }));
                     self.phase = Phase::Combat;
@@ -363,6 +426,7 @@ impl Bridge {
                     if let Some(me) = self.self_guid {
                         self.emit(SessionEvent::ClientControl { mover: me, allow_move: true });
                     }
+                    super::set_exile_spectating(false);
                     self.phase = Phase::Free;
                 }
                 _ => {}
@@ -381,9 +445,10 @@ impl Bridge {
         }
         // Free mode's NPCs and interactables would be hidden here (none are spawned yet).
         self.emit(SessionEvent::ClientControl { mover: me, allow_move: false });
+        super::set_exile_spectating(true);
         self.emit(SessionEvent::Worldport {
             map_id: MAP_ID,
-            position: BATTLE_CENTER,
+            position: self.ground.on_ground(BATTLE_CENTER),
             orientation: 0.0,
             needs_ack: true,
         });
@@ -469,12 +534,18 @@ impl Bridge {
             "ui.character.list.result" => self.roster_from(data),
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
+                (self.frames, self.moves, self.turns) = (0, 0, 0);
                 self.focus = data["focusId"].as_str().map(str::to_owned);
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => self.frame(data),
             "combat.end" => {
-                bevy::log::info!("exile: combat ends {data}");
+                bevy::log::info!(
+                    "exile: combat ends after {} frames, {} moves, {} turns sent {data}",
+                    self.frames,
+                    self.moves,
+                    self.turns
+                );
                 self.combat = None;
                 self.clear_due = Some(Instant::now() + CLEAR_DELAY);
             }
@@ -585,38 +656,88 @@ impl Bridge {
     /// the frame's damage as melee swings with floating numbers (`AttackerState`). The hero is a
     /// unit of its own, apart from the (hidden) player (§5.1).
     fn frame(&mut self, data: &Value) {
+        self.frames += 1;
+        let trace = self.frames % 30 == 1;
         let mut seen = Vec::new();
         for actor in data["actors"].as_array().into_iter().flatten() {
             let Some(id) = actor["id"].as_str() else { continue };
             seen.push(id.to_owned());
-            let pos = to_world(actor["x"].as_f64().unwrap_or(0.0), actor["y"].as_f64().unwrap_or(0.0));
-            let facing = actor["angle"].as_f64().unwrap_or(0.0) as f32;
+            let (x, y) = (actor["x"].as_f64().unwrap_or(0.0), actor["y"].as_f64().unwrap_or(0.0));
+            let pos = self.to_world(x, y);
+            // DQQ keeps no facing for actors (their `angle` stays 0): they face where they walk,
+            // or, standing, their target (`targetX`/`targetY`).
+            let target = match (actor["targetX"].as_f64(), actor["targetY"].as_f64()) {
+                (Some(tx), Some(ty)) => Some(self.to_world(tx, ty)),
+                _ => None,
+            };
             let max_life = actor["maxLife"].as_f64().unwrap_or(100.0).max(1.0).ceil() as u32;
             let life = actor["life"].as_f64().unwrap_or(max_life as f64).max(0.0).ceil() as u32;
+            if trace && (self.focus.as_deref() == Some(id) || seen.len() <= 2) {
+                bevy::log::info!(
+                    "exile: frame {} actor {id} dqq ({x:.3}, {y:.3}) moving {} target {:?} → world ({:.2}, {:.2}, {:.2})",
+                    self.frames,
+                    actor["moving"],
+                    (actor["targetX"].as_f64(), actor["targetY"].as_f64()),
+                    pos[0],
+                    pos[1],
+                    pos[2]
+                );
+            }
             // The combat's creator is played by the player's own body (D28): first seen, it takes
             // the self guid, so the camera's stock chase follows it.
             if !self.shown.contains_key(id) && self.focus.as_deref() == Some(id) {
                 if let Some(me) = self.self_guid {
-                    self.shown.insert(id.to_owned(), Shown { guid: me, pos: BATTLE_CENTER, life });
+                    let from = self.ground.on_ground(BATTLE_CENTER);
+                    self.shown.insert(id.to_owned(), Shown { guid: me, pos: from, life, facing: 0.0 });
                 }
             }
             if let Some(shown) = self.shown.get(id) {
-                let (guid, from, old_life) = (shown.guid, shown.pos, shown.life);
-                let moved = (pos[0] - from[0]).hypot(pos[1] - from[1]);
-                if moved > 0.05 {
+                let (guid, from, old_life, old_facing) = (shown.guid, shown.pos, shown.life, shown.facing);
+                let (dx, dy) = (pos[0] - from[0], pos[1] - from[1]);
+                let moved = dx.hypot(dy);
+                let mut facing = old_facing;
+                if moved > 0.01 {
+                    // A walk: the unit faces its way (`MonsterMoveFacing::None`).
+                    facing = wow_facing(dx, dy);
                     self.spline_id = self.spline_id.wrapping_add(1);
+                    self.moves += 1;
                     self.emit(SessionEvent::MonsterMove {
                         guid,
                         transport: None,
                         start: from,
                         spline_id: self.spline_id,
-                        path: vec![pos],
+                        // A path starts at the wire's start point, as the packet decodes it: a
+                        // one-point path installs no spline (`monster_move_spline`), no walk.
+                        path: vec![from, pos],
                         facing: MonsterMoveFacing::None,
                         stop: false,
                         duration_ms: 40,
                         flying: false,
                         run_mode: true,
                     });
+                } else if let Some(t) = target {
+                    // Standing: turn to the target when it is off by more than a few degrees.
+                    let (tx, ty) = (t[0] - pos[0], t[1] - pos[1]);
+                    if tx.hypot(ty) > 0.05 {
+                        let want = wow_facing(tx, ty);
+                        if angle_gap(want, old_facing) > 0.1 {
+                            facing = want;
+                            self.spline_id = self.spline_id.wrapping_add(1);
+                            self.turns += 1;
+                            self.emit(SessionEvent::MonsterMove {
+                                guid,
+                                transport: None,
+                                start: from,
+                                spline_id: self.spline_id,
+                                path: Vec::new(),
+                                facing: MonsterMoveFacing::Angle(want),
+                                stop: true,
+                                duration_ms: 0,
+                                flying: false,
+                                run_mode: false,
+                            });
+                        }
+                    }
                 }
                 if life != old_life {
                     self.emit(SessionEvent::ObjectValues {
@@ -625,8 +746,11 @@ impl Bridge {
                     });
                 }
                 if let Some(s) = self.shown.get_mut(id) {
-                    s.pos = pos;
+                    if moved > 0.01 {
+                        s.pos = pos;
+                    }
                     s.life = life;
+                    s.facing = facing;
                 }
             } else {
                 let guid = self.next_creature;
@@ -634,6 +758,10 @@ impl Bridge {
                 let player = actor["kind"].as_str() == Some("player");
                 let key = actor["model"].as_str().unwrap_or("Kobold").to_owned();
                 let display = self.models.resolve(&key);
+                let facing = target
+                    .map(|t| (t[0] - pos[0], t[1] - pos[1]))
+                    .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
+                    .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
                 self.emit(unit_create(
                     guid,
                     EntityKind::Unit,
@@ -650,7 +778,7 @@ impl Bridge {
                         ),
                     ],
                 ));
-                self.shown.insert(id.to_owned(), Shown { guid, pos, life });
+                self.shown.insert(id.to_owned(), Shown { guid, pos, life, facing });
             }
         }
         let gone: Vec<String> = self.shown.keys().filter(|k| !seen.contains(k)).cloned().collect();
@@ -685,14 +813,16 @@ impl Bridge {
     }
 }
 
-/// DQQ battlefield `(x, y)` (double, 0..10) → WoW world coordinates centred on [`BATTLE_CENTER`]; the ground height
-/// is the client's ground clamp's to settle.
-fn to_world(x: f64, y: f64) -> [f32; 3] {
-    [
-        BATTLE_CENTER[0] + (x - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
-        BATTLE_CENTER[1] + (y - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
-        BATTLE_CENTER[2],
-    ]
+/// The WoW facing (radians, 0 = +x north, counter-clockwise, in `[0, 2π)`) of a world-space
+/// step `(dx, dy)`.
+fn wow_facing(dx: f32, dy: f32) -> f32 {
+    dy.atan2(dx).rem_euclid(std::f32::consts::TAU)
+}
+
+/// The unsigned gap between two facings, radians in `[0, π]`.
+fn angle_gap(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(std::f32::consts::TAU);
+    d.min(std::f32::consts::TAU - d)
 }
 
 /// A unit or player create, as the update stream carries it: `OBJECT_FIELD_TYPE`, the display

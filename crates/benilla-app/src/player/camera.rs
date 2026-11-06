@@ -1466,7 +1466,8 @@ pub(super) fn run_look_session(
         }
         // The hand-off to the body behind the TurnOrAction bit (`0x5145fa`), which a both-button
         // run holds too.
-        if holds(LookButton::Right) {
+        // Exile replay (D29): the body is the replay's, so a right-drag only orbits.
+        if holds(LookButton::Right) && !crate::net::exile_spectating() {
             *face_yaw = cam.yaw;
             handed = motion != Vec2::ZERO;
         }
@@ -1704,7 +1705,10 @@ pub(super) fn seat_camera(
         cam.yaw += turn_delta;
     }
     if let Some(yaw) = rig.follow.advance(follow, cam.yaw, dt, look_held) {
-        cam.yaw = yaw;
+        // Exile replay (D29): the camera stays where the player left it.
+        if !crate::net::exile_spectating() {
+            cam.yaw = yaw;
+        }
     }
     // The framing pivot is `feet + cam_pivot_height`; at zoom 0 the camera sits on it. One sweep
     // runs from the head (the capsule's top hemisphere centre) to `pivot - fwd·zoom`, and body
