@@ -816,6 +816,11 @@ pub(super) fn playback_rate(clip: &AnimClip, speed: f32, model_scale: f32) -> f3
 /// `abs()`: `moveSpeed` is signed, and a backwards gait (-2.5) must stay at 1×.
 pub(super) fn scaled_rate(clip: &AnimClip, speed: f32, model_scale: f32) -> Option<f32> {
     let divisor = clip.move_speed * model_scale.abs();
+    // Exile replay (user, 2026-11-06): the walk and run cycles play at their standard pace, not
+    // matched to the (short, slow) DQQ steps.
+    if crate::net::exile_spectating() {
+        return (divisor > 0.0 && RATE_SCALED.contains(&clip.anim_id)).then_some(1.0);
+    }
     (divisor > 0.0 && RATE_SCALED.contains(&clip.anim_id)).then(|| speed / divisor)
 }
 
