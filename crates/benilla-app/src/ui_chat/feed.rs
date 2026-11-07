@@ -2263,6 +2263,11 @@ pub(crate) fn release_display(mut firing: ChatFiring) {
 
 /// The leave-world sweep's chat leg (`0x490a9e` → `0x498a10`): the display latch set.
 pub(super) fn latch_on_leave_world(log: Option<Res<ChatLog>>) {
+    // Exile mode: as at the session start (`net::latch_on_connect`), no cascade ever releases it
+    // after a worldport, and a set latch holds every chat and addon line back for good.
+    if crate::net::exile_mode() {
+        return;
+    }
     if let Some(log) = log {
         log.latch();
     }
