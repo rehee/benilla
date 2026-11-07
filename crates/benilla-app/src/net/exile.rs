@@ -70,6 +70,9 @@ const YARDS_PER_UNIT: f32 = 2.0;
 /// `.lineup`: models per row, and yards between them at size 1.
 const LINEUP_ROW: usize = 6;
 const LINEUP_GAP: f32 = 3.5;
+/// The side of the square around a battlefield cleared of doodads, yards: DQQ fields go up to
+/// 100×100 units, 2 yards each (user 2026-11-07); `maps.json` `clear` overrides it per scene.
+const DEFAULT_CLEAR: f32 = 200.0;
 /// How long a replay trip waits on its battlefield (`combat.prepare.result`).
 const PREPARE_WAIT: Duration = Duration::from_secs(5);
 /// The lineup's creature entries (names) start here, clear of any real template.
@@ -982,6 +985,7 @@ impl Bridge {
         if self.prepare_due.take().is_none() || self.phase != Phase::Free {
             return;
         }
+        let mut clear = DEFAULT_CLEAR;
         if let Some(b) = battle {
             let n = |i: usize| b["center"][i].as_f64().map(|v| v as f32);
             if let (Some(x), Some(y)) = (n(0), n(1)) {
@@ -989,7 +993,14 @@ impl Bridge {
                 bevy::log::info!("exile: battlefield {} ({}) on map {map} at ({x:.1}, {y:.1})", b["scene"], b["map"]);
                 self.battle = [x, y, n(2).unwrap_or(self.battle[2])];
                 self.battle_map = map;
+                clear = b["clear"].as_f64().map_or(DEFAULT_CLEAR, |c| c as f32);
             }
+        }
+        // The battlefield's surroundings without their doodads (rocks, trees, ruins…) while the
+        // combat is shown: a `clear`-yard square, set before the port so the tiles it reads honour
+        // it; the port home clears it (user 2026-11-07).
+        if clear > 0.0 {
+            benilla_world::exile_clear::set_clear_zone(Some(([self.battle[0], self.battle[1]], clear / 2.0)));
         }
         // The port first, so its loading screen (at least 0.5 s in Exile mode) covers the terrain
         // read below; the player is set on the ground when the port is acked (`create_self`).
@@ -1102,6 +1113,8 @@ impl Bridge {
             }
             // Back to free mode: home; the controls come back on the port's ack.
             if me.is_some() {
+                // The battlefield's doodads come back with the tiles read for home.
+                benilla_world::exile_clear::set_clear_zone(None);
                 self.emit(SessionEvent::Worldport {
                     map_id: self.home_map,
                     position: self.home,

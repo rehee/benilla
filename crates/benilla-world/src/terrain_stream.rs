@@ -71,6 +71,9 @@ pub struct TerrainStreamer {
     tiles: HashMap<(i32, i32), TileState>,
     /// The map directory the tiles are for; a change drops every tile.
     map_dir: Option<String>,
+    /// Exile mode: the clear zone's generation the tiles were placed under; a change drops every
+    /// tile, so the zone's doodads go (or come back) on the re-read (`exile_clear`).
+    exile_clear_gen: u64,
     /// The focus tile last streamed around, the furnisher's nearest-first key.
     focus: (i32, i32),
     /// The window's `(inner, outer)` half-widths last frame, logged once per change.
@@ -657,6 +660,22 @@ fn stream_terrain(
         state.wdt = Some(asset_server.load(format!("mpq://World/Maps/{dir}/{dir}.wdt")));
         state.wdt_ungated = false;
     }
+    // Exile mode: the battlefield's clear zone changed (set before the port to a combat, cleared
+    // before the port home): drop every tile, re-read under the port's loading screen.
+    let clear_gen = crate::exile_clear::generation();
+    if state.exile_clear_gen != clear_gen {
+        info!("terrain: clear zone changed, {} tiles released", state.tiles.len());
+        drop_streamed_world(
+            &mut commands,
+            &mut state,
+            placements,
+            &mut welds,
+            &mut static_merge,
+            staticgx.as_deref_mut(),
+            &mut activity,
+        );
+        state.exile_clear_gen = clear_gen;
+    }
     // A failed WDT falls back to ungated probing, warned once per map, never to no world.
     let wdt_index = state.wdt.as_ref().and_then(|h| wdts.get(h));
     let one_object = wdt_index.is_some_and(|w| w.is_one_object());
@@ -1053,6 +1072,10 @@ fn spawn_streamed_tiles(
         // Placements register by uniqueId; their ground shade resolves at spawn by a global lookup,
         // since a doodad's origin may lie on another tile.
         for d in &adt.doodads {
+            // Exile mode: the battlefield's clear zone places no doodads (`exile_clear`).
+            if crate::exile_clear::cleared(d.position[0], d.position[1]) {
+                continue;
+            }
             register_doodad(placements, &asset_server, d, (tx, ty));
             tile.placements.push(d.unique_id);
         }

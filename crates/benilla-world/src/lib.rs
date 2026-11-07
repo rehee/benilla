@@ -132,6 +132,7 @@ pub mod mac_quit;
 pub mod map_proj;
 pub mod mat_anim_table;
 pub mod mesh_tag;
+pub mod exile_clear;
 pub mod model_fade;
 pub mod model_forms;
 pub mod model_render;
