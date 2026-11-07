@@ -70,6 +70,8 @@ const YARDS_PER_UNIT: f32 = 2.0;
 /// `.lineup`: models per row, and yards between them at size 1.
 const LINEUP_ROW: usize = 6;
 const LINEUP_GAP: f32 = 3.5;
+/// How long a replay trip waits on its battlefield (`combat.prepare.result`).
+const PREPARE_WAIT: Duration = Duration::from_secs(5);
 /// The lineup's creature entries (names) start here, clear of any real template.
 const LINEUP_ENTRY: u32 = 900_000;
 
@@ -451,6 +453,12 @@ struct Bridge {
     player_names: HashMap<u64, String>,
     /// Each roster entry's hero `dress` (look and gear), worn by the player's own unit.
     hero_dress: HashMap<u64, Value>,
+    /// The battlefield's centre (runtime `combat.prepare.result`, PLAN-0006 E; [`BATTLE_CENTER`]
+    /// until one comes), where free mode returns to (`.goto` moves it), and a replay trip waiting
+    /// on its battlefield (given up at the deadline: the default field).
+    battle: [f32; 3],
+    home: [f32; 3],
+    prepare_due: Option<Instant>,
     /// The shown combat's heroes (`combat.begin` `heroes`): DQQ actor id → `dress` from the seed.
     heroes: HashMap<String, Value>,
     dress_items: HashMap<u32, (u32, u32, u32, u32)>,
@@ -499,6 +507,9 @@ impl Bridge {
             player_names: HashMap::new(),
             hero_dress: HashMap::new(),
             heroes: HashMap::new(),
+            battle: BATTLE_CENTER,
+            home: ORIGIN,
+            prepare_due: None,
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
             ready_quiet: None,
@@ -517,9 +528,9 @@ impl Bridge {
     /// [`BATTLE_CENTER`], standing on the terrain there.
     fn to_world(&self, x: f64, y: f64) -> [f32; 3] {
         self.ground.on_ground([
-            BATTLE_CENTER[0] + (x - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
-            BATTLE_CENTER[1] + (y - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
-            BATTLE_CENTER[2],
+            self.battle[0] + (x - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+            self.battle[1] + (y - DQQ_FIELD_HALF) as f32 * YARDS_PER_UNIT,
+            self.battle[2],
         ])
     }
 
@@ -580,6 +591,11 @@ impl Bridge {
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
                 self.start_replay();
             }
+            // `.goto <x> <y>`: scout a battlefield (PLAN-0006 E).
+            ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".goto") => {
+                let args = text.trim_start().trim_start_matches(".goto").to_owned();
+                self.goto(&args);
+            }
             // `.lineup <display>…`: a review row of models (PLAN-0006).
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".lineup") => {
                 let args = text.trim_start().trim_start_matches(".lineup").to_owned();
@@ -612,7 +628,7 @@ impl Bridge {
                 Phase::Porting => {
                     // A worldport clears the world; the player's own unit comes again, as a server
                     // re-sends it after the port.
-                    self.create_self(self.ground.on_ground(BATTLE_CENTER), COMBAT_WALK_SPEED);
+                    self.create_self(self.ground.on_ground(self.battle), COMBAT_WALK_SPEED);
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
                     let replay = self.replay_id.take();
                     let file = self.replay_file.take();
@@ -629,7 +645,7 @@ impl Bridge {
                     self.phase = Phase::Combat;
                 }
                 Phase::Returning => {
-                    self.create_self(ORIGIN, FREE_WALK_SPEED);
+                    self.create_self(self.home, FREE_WALK_SPEED);
                     if let Some(me) = self.self_guid {
                         self.emit(SessionEvent::ClientControl { mover: me, allow_move: true });
                     }
@@ -649,7 +665,7 @@ impl Bridge {
     /// (`ui.mapping.mobs`), each under its DQQ name. A bare `.lineup` clears the row. A review aid
     /// for the DQQ → WoW tables (PLAN-0006).
     fn lineup(&mut self, args: &str) {
-        let mut words = args.split_whitespace();
+        let words = args.split_whitespace();
         if words.clone().next() == Some("mobs") {
             // `.lineup mobs [name…]`: only the named monsters, when any are named.
             self.lineup_only = words.skip(1).map(str::to_ascii_lowercase).collect();
@@ -932,22 +948,120 @@ impl Bridge {
             bevy::log::info!("exile: a replay is already under way");
             return;
         }
+        if self.prepare_due.is_some() {
+            return;
+        }
         // Free mode's NPCs and interactables would be hidden here (none are spawned yet).
         self.emit(SessionEvent::ClientControl { mover: me, allow_move: false });
         super::set_exile_spectating(true);
+        // The battlefield first (the recording's DQQ map → a WoW scene, runtime `maps.json`):
+        // the port goes there once it is known.
+        let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
+        self.send(
+            "combat.prepare",
+            json!({ "replayId": self.replay_id, "file": self.replay_file, "characterId": id }),
+        );
+        self.prepare_due = Some(Instant::now() + PREPARE_WAIT);
+    }
+
+    /// `combat.prepare.result` (or none by [`PREPARE_WAIT`]: the field kept): the battlefield's
+    /// centre, its ground loaded, then the port.
+    fn port_to_battle(&mut self, battle: Option<&Value>) {
+        if self.prepare_due.take().is_none() || self.phase != Phase::Free {
+            return;
+        }
+        if let Some(b) = battle {
+            let n = |i: usize| b["center"][i].as_f64().map(|v| v as f32);
+            if let (Some(x), Some(y)) = (n(0), n(1)) {
+                let centre = [x, y, n(2).unwrap_or(self.battle[2])];
+                bevy::log::info!("exile: battlefield {} ({}) at ({x:.1}, {y:.1})", b["scene"], b["map"]);
+                if (centre[0] - self.battle[0]).hypot(centre[1] - self.battle[1]) > 1.0 {
+                    self.ground = Ground::load(centre);
+                }
+                self.battle = self.ground.on_ground(centre);
+            }
+        }
         self.emit(SessionEvent::Worldport {
             map_id: MAP_ID,
-            position: self.ground.on_ground(BATTLE_CENTER),
+            position: self.ground.on_ground(self.battle),
             orientation: 0.0,
             needs_ack: true,
         });
         self.phase = Phase::Porting;
     }
 
+    /// `.goto <x> <y> [r]` in free mode (with `r`, the flattest spot within `r` yards): the player
+    /// ported there (map 0), standing on the ground, and
+    /// the spot's relief logged: the height spread over the DQQ field's square around it, to scout
+    /// flat battlefields (PLAN-0006 E). Free mode returns here after a combat.
+    fn goto(&mut self, args: &str) {
+        let v: Vec<f32> = args.split(|c: char| c.is_whitespace() || c == ',').filter_map(|w| w.parse().ok()).collect();
+        let (Some(&x0), Some(&y0)) = (v.first(), v.get(1)) else { return };
+        // `.goto x y r`: the flattest spot within `r` yards instead (a 10-yard grid).
+        let radius = v.get(2).copied().unwrap_or(0.0).clamp(0.0, 400.0);
+        if self.phase != Phase::Free || self.self_guid.is_none() {
+            return;
+        }
+        let ground = Ground::load([x0, y0, 0.0]);
+        let half = DQQ_FIELD_HALF as f32 * YARDS_PER_UNIT;
+        // The height spread over the field's square around a spot (`None` with a hole in it).
+        let relief = |x: f32, y: f32| -> Option<f32> {
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for i in -5..=5 {
+                for j in -5..=5 {
+                    let (px, py) = (x + i as f32 * half / 5.0, y + j as f32 * half / 5.0);
+                    let z = ground.tiles.iter().find_map(|t| benilla_formats::terrain_height_at(&t.chunks, [px, py, 0.0]))?;
+                    lo = lo.min(z);
+                    hi = hi.max(z);
+                }
+            }
+            Some(hi - lo)
+        };
+        let (mut x, mut y) = (x0, y0);
+        let z0 = ground.z(x0, y0, 0.0);
+        if radius > 0.0 {
+            let steps = (radius / 10.0) as i32;
+            let mut best: Vec<(f32, f32, f32)> = Vec::new();
+            for i in -steps..=steps {
+                for j in -steps..=steps {
+                    let (px, py) = (x0 + i as f32 * 10.0, y0 + j as f32 * 10.0);
+                    if (px - x0).hypot(py - y0) > radius {
+                        continue;
+                    }
+                    // Not much below the start (the sea floor is flat too, but under water).
+                    if ground.z(px, py, f32::MIN) < z0 - 2.0 {
+                        continue;
+                    }
+                    if let Some(r) = relief(px, py) {
+                        best.push((r, px, py));
+                    }
+                }
+            }
+            best.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (r, px, py) in best.iter().take(5) {
+                bevy::log::info!("exile: flat spot ({px:.1}, {py:.1}) relief {r:.2} yd");
+            }
+            if let Some(&(_, px, py)) = best.first() {
+                (x, y) = (px, py);
+            }
+        }
+        let flat = relief(x, y);
+        let z = ground.z(x, y, 0.0);
+        bevy::log::info!("exile: goto ({x:.1}, {y:.1}) z {z:.2}: relief {flat:?} yd over ±{half} yd");
+        self.ground = ground;
+        self.home = [x, y, z + 0.5];
+        self.emit(SessionEvent::Worldport { map_id: MAP_ID, position: self.home, orientation: 0.0, needs_ack: true });
+        self.phase = Phase::Returning;
+    }
+
     /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
         self.ready_check(now);
+        if self.prepare_due.is_some_and(|t| now >= t) {
+            bevy::log::info!("exile: no battlefield from the runtime, the default field");
+            self.port_to_battle(None);
+        }
         if self.combat_due.is_some_and(|t| now >= t) {
             self.combat_due = None;
             self.start_replay();
@@ -968,7 +1082,7 @@ impl Bridge {
             if me.is_some() {
                 self.emit(SessionEvent::Worldport {
                     map_id: MAP_ID,
-                    position: ORIGIN,
+                    position: self.home,
                     orientation: 0.0,
                     needs_ack: true,
                 });
@@ -1087,6 +1201,7 @@ impl Bridge {
             "hello" => bevy::log::info!("exile: runtime says hello {data}"),
             "ui.character.list.result" => self.roster_from(data),
             "ui.mapping.mobs.result" => self.lineup_mobs(data),
+            "combat.prepare.result" => self.port_to_battle(Some(data)),
             "ui.replay.list.result" => self.replays_to_addon(data),
             "ui.replay.files.result" => self.files_to_addon(data),
             "ui.replay.export.result" => {
@@ -1304,7 +1419,7 @@ impl Bridge {
             // the self guid, so the camera's stock chase follows it.
             if !self.shown.contains_key(id) && self.focus.as_deref() == Some(id) {
                 if let Some(me) = self.self_guid {
-                    let from = self.ground.on_ground(BATTLE_CENTER);
+                    let from = self.ground.on_ground(self.battle);
                     // The hero is the human female standard: her size is her scale.
                     let mut fields = vec![(FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits())];
                     // The seed's gear (user 2026-11-07: combat shows the recording's character),
