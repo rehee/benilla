@@ -471,6 +471,8 @@ struct Bridge {
     /// The WoW maps of the two (`Map.dbc` ids; user 2026-11-07: all of Azeroth).
     battle_map: u32,
     home_map: u32,
+    /// `.replay <scene>`: the next trip's battlefield scene, over the recording's own.
+    scene_override: Option<String>,
     prepare_due: Option<Instant>,
     /// The shown combat's heroes (`combat.begin` `heroes`): DQQ actor id → `dress` from the seed.
     heroes: HashMap<String, Value>,
@@ -524,6 +526,7 @@ impl Bridge {
             home: ORIGIN,
             battle_map: MAP_ID,
             home_map: MAP_ID,
+            scene_override: None,
             prepare_due: None,
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
@@ -603,7 +606,11 @@ impl Bridge {
     /// player does reaches the combat (D29).
     fn on_command(&mut self, cmd: &ClientCommand) {
         match cmd {
+            // `.replay [scene]`: the latest recording, on the named battlefield scene (`maps.json`)
+            // instead of its own when one is given (a test aid, user 2026-11-07).
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
+                let scene = text.trim_start().trim_start_matches(".replay").trim();
+                self.scene_override = (!scene.is_empty()).then(|| scene.to_owned());
                 self.start_replay();
             }
             // `.goto <x> <y>`: scout a battlefield (PLAN-0006 E).
@@ -972,9 +979,15 @@ impl Bridge {
         // The battlefield first (the recording's DQQ map → a WoW scene, runtime `maps.json`):
         // the port goes there once it is known.
         let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
+        let scene = self.scene_override.take();
         self.send(
             "combat.prepare",
-            json!({ "replayId": self.replay_id, "file": self.replay_file, "characterId": id }),
+            json!({
+                "replayId": self.replay_id,
+                "file": self.replay_file,
+                "characterId": id,
+                "scene": scene,
+            }),
         );
         self.prepare_due = Some(Instant::now() + PREPARE_WAIT);
     }
@@ -1060,8 +1073,10 @@ impl Bridge {
                     if (px - x0).hypot(py - y0) > radius {
                         continue;
                     }
-                    // Not much below the start (the sea floor is flat too, but under water).
-                    if ground.z(px, py, f32::MIN) < z0 - 2.0 {
+                    // About the start's height: not below it (the sea floor is flat too, but under
+                    // water), nor up a hill (a beach stays a beach).
+                    let pz = ground.z(px, py, f32::MIN);
+                    if pz < z0 - 2.0 || pz > z0 + 4.0 {
                         continue;
                     }
                     if let Some(r) = relief(px, py) {
