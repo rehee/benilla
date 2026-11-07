@@ -451,6 +451,8 @@ struct Bridge {
     player_names: HashMap<u64, String>,
     /// Each roster entry's hero `dress` (look and gear), worn by the player's own unit.
     hero_dress: HashMap<u64, Value>,
+    /// The shown combat's heroes (`combat.begin` `heroes`): DQQ actor id → `dress` from the seed.
+    heroes: HashMap<String, Value>,
     dress_items: HashMap<u32, (u32, u32, u32, u32)>,
     next_dressed: u64,
 }
@@ -496,6 +498,7 @@ impl Bridge {
             creature_names: HashMap::new(),
             player_names: HashMap::new(),
             hero_dress: HashMap::new(),
+            heroes: HashMap::new(),
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
             ready_quiet: None,
@@ -1097,6 +1100,11 @@ impl Bridge {
                 (self.ready_first, self.ready_quiet, self.ready_sent) = (None, None, false);
                 (self.flag_moved, self.flag_still, self.noflag_moved) = (0, 0, 0);
                 self.focus = data["focusId"].as_str().map(str::to_owned);
+                // Each hero's look in the recording's seed (its gear then, not now).
+                self.heroes = data["heroes"]
+                    .as_object()
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => {
@@ -1298,12 +1306,22 @@ impl Bridge {
                 if let Some(me) = self.self_guid {
                     let from = self.ground.on_ground(BATTLE_CENTER);
                     // The hero is the human female standard: her size is her scale.
+                    let mut fields = vec![(FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits())];
+                    // The seed's gear (user 2026-11-07: combat shows the recording's character),
+                    // every held and worn slot set, so what the seed lacks comes off. Home again,
+                    // `create_self` puts the roster's gear back.
+                    if let Some(dress) = self.heroes.get(id).cloned() {
+                        let worn = self.dress_fields(&dress);
+                        for slot in 0..19u16 {
+                            let field = FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot;
+                            let entry = worn.iter().find(|(f, _)| *f == field).map_or(0, |(_, e)| *e);
+                            fields.push((field, entry));
+                        }
+                        fields.extend(worn.into_iter().filter(|(f, _)| *f < FIELD_PLAYER_VISIBLE_ITEM_1_0));
+                    }
                     self.emit(SessionEvent::ObjectValues {
                         guid: me,
-                        fields: ObjectFields::from_pairs(&[(
-                            FIELD_OBJECT_SCALE_X,
-                            actor_size(actor).to_bits(),
-                        )]),
+                        fields: ObjectFields::from_pairs(&fields),
                     });
                     self.shown.insert(id.to_owned(), Shown {
                             guid: me,
@@ -1408,10 +1426,11 @@ impl Bridge {
                     .map(|t| (t[0] - pos[0], t[1] - pos[1]))
                     .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
                     .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
-                let guid = if actor["dress"].is_object() {
-                    // A dressed humanoid (runtime `Dress`): a player-style unit in its gear.
-                    let name = actor["mob"].as_str().unwrap_or_default().to_owned();
-                    let dress = actor["dress"].clone();
+                let seed_dress = self.heroes.get(id).cloned().filter(|_| player);
+                let guid = if let Some(dress) = seed_dress.or_else(|| Some(actor["dress"].clone()).filter(Value::is_object)) {
+                    // A dressed humanoid (runtime `Dress`, or a hero's from the seed): a
+                    // player-style unit in its gear.
+                    let name = actor["mob"].as_str().or(actor["name"].as_str()).unwrap_or_default().to_owned();
                     self.dress_create(
                         &dress,
                         name,
@@ -1423,7 +1442,10 @@ impl Bridge {
                             (FIELD_UNIT_HEALTH, life),
                             (FIELD_UNIT_MAXHEALTH, max_life),
                             (FIELD_UNIT_LEVEL, 1),
-                            (FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE),
+                            (
+                                FIELD_UNIT_FACTIONTEMPLATE,
+                                if player { FACTION_PLAYER } else { FACTION_HOSTILE },
+                            ),
                         ],
                     )
                 } else {
