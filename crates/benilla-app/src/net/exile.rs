@@ -10,7 +10,7 @@
 //!
 //! Exile 模式：不连 WoW 服务器，由 Exile Runtime 经本机 WebSocket 驱动客户端（本仓库为 rehee/benilla 分支）。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -187,13 +187,19 @@ struct Shown {
     last_dqq: [f32; 3],
     /// A DQQ enemy (else the hero's side).
     enemy: bool,
+    /// The frame the walk under way started on (`None`: standing).
+    walk_start: Option<u64>,
 }
 
-/// A walk is shown in segments of this many frames (user rule, 2026-11-06): a walk that starts
-/// plays at least this long; at the segment's end a still unit stops, a moving one goes straight
-/// on into the next segment, the walk cycle running on unbroken. The frames are shown this many
-/// frames late, so each segment's path is known whole when it starts.
-const SEGMENT_FRAMES: usize = 5;
+/// A walk that starts plays at least this many frames (user rule, 2026-11-06): each frame's step
+/// is sent as it comes (no frame is held back, 2026-11-07), its spline stretched to reach this
+/// many frames past the walk's start; a unit still moving goes straight on, the run cycle unbroken.
+const SEGMENT_FRAMES: u64 = 5;
+/// A step's spline lasts this many frames, so the next step takes over before it ends and the
+/// run never gaps to the stance: DQQ's steps come every frame to every third (measured
+/// 2026-11-07: at 1.5 frames the run broke into the stance for 16~50 ms between steps). The
+/// cost: a walk's end shows up to this long after DQQ stopped.
+const STEP_FRAMES: f32 = 4.0;
 /// The walk speeds units are created with. The client picks Run over Walk above twice the walk
 /// speed, and DQQ's units cover about a yard a second, so in combat the walk speed is set so low
 /// that every walk shows the run (user, 2026-11-06); free mode keeps the stock 2.5.
@@ -201,8 +207,6 @@ const COMBAT_WALK_SPEED: f32 = 0.05;
 const FREE_WALK_SPEED: f32 = 2.5;
 /// One DQQ tick, milliseconds (30 ticks/s).
 const TICK_MS: f32 = 1000.0 / 30.0;
-/// A segment shorter than this (yards) is no walk.
-const WALK_MIN: f32 = 0.05;
 
 /// The terrain under the battlefield, read from the install's ADT tiles once, so every actor
 /// stands on the ground: a creature's height is the server's (here, ours) to give, not the
@@ -413,9 +417,6 @@ struct Bridge {
     frames: u64,
     moves: u64,
     turns: u64,
-    /// The last [`SEGMENT_FRAMES`] frames received, not yet shown: the lookahead of the walk
-    /// segments.
-    pending: VecDeque<Value>,
     /// The `moving` flag census: (flag set, moved), (flag set, still), (flag clear, moved).
     flag_moved: u64,
     flag_still: u64,
@@ -463,7 +464,6 @@ impl Bridge {
             frames: 0,
             moves: 0,
             turns: 0,
-            pending: VecDeque::new(),
             flag_moved: 0,
             flag_still: 0,
             noflag_moved: 0,
@@ -850,30 +850,18 @@ impl Bridge {
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
                 (self.ready_first, self.ready_quiet, self.ready_sent) = (None, None, false);
                 (self.flag_moved, self.flag_still, self.noflag_moved) = (0, 0, 0);
-                self.pending.clear();
                 self.focus = data["focusId"].as_str().map(str::to_owned);
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => {
-                // The start's frames show at once: the runtime holds after them until the
-                // models are up ([`Self::ready_check`]).
+                self.frame(data);
+                // The start's frames: the runtime holds after them until the models are up
+                // ([`Self::ready_check`]).
                 if !self.ready_sent {
-                    self.frame(data);
                     self.ready_first.get_or_insert_with(Instant::now);
-                    return;
-                }
-                self.pending.push_back(data.clone());
-                while self.pending.len() > SEGMENT_FRAMES {
-                    if let Some(f) = self.pending.pop_front() {
-                        self.frame(&f);
-                    }
                 }
             }
             "combat.end" => {
-                // The frames still held back play out now, their walks shortened to what is left.
-                while let Some(f) = self.pending.pop_front() {
-                    self.frame(&f);
-                }
                 bevy::log::info!(
                     "exile: moving flag census: set+moved {}, set+still {}, clear+moved {}",
                     self.flag_moved,
@@ -1051,6 +1039,7 @@ impl Bridge {
                             walk_until: 0,
                             last_dqq: pos,
                             enemy: false,
+                            walk_start: None,
                         });
                 }
             }
@@ -1068,58 +1057,39 @@ impl Bridge {
                 let mut facing = old_facing;
                 let mut shown_at = from;
                 let mut until = walk_until;
-                if self.frames >= walk_until {
-                    // No segment under way: the next frames' path decides walk or stand.
-                    let mut path = vec![from];
-                    for f in &self.pending {
-                        let Some(next) = f["actors"]
-                            .as_array()
-                            .and_then(|a| a.iter().find(|a| a["id"].as_str() == Some(id)))
-                        else {
-                            break;
-                        };
-                        let p = self.to_world(
-                            next["x"].as_f64().unwrap_or(0.0),
-                            next["y"].as_f64().unwrap_or(0.0),
-                        );
-                        path.push(p);
-                    }
-                    // This frame's own spot leads when no lookahead is left (the combat's end).
-                    if path.len() == 1 {
-                        path.push(pos);
-                    }
-                    let steps = path.len() - 1;
-                    let length: f32 = path
-                        .windows(2)
-                        .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
-                        .sum();
-                    let end = path[steps];
-                    if length > WALK_MIN {
-                        // A segment: the whole stretch at its average speed, the unit facing its
-                        // way. Back to back, one segment's end is the next one's start, so the
-                        // walk runs on without restarting.
-                        path.dedup_by(|b, a| (b[0] - a[0]).hypot(b[1] - a[1]) < 0.001);
-                        let last = path[path.len() - 2];
-                        facing = wow_facing(end[0] - last[0], end[1] - last[1]);
-                        self.spline_id = self.spline_id.wrapping_add(1);
-                        self.moves += 1;
-                        self.emit(SessionEvent::MonsterMove {
-                            guid,
-                            transport: None,
-                            start: from,
-                            spline_id: self.spline_id,
-                            // A path starts at the wire's start point, as the packet decodes it:
-                            // a one-point path installs no spline (`monster_move_spline`).
-                            path,
-                            facing: MonsterMoveFacing::None,
-                            stop: false,
-                            duration_ms: (steps as f32 * TICK_MS).round() as u32,
-                            flying: false,
-                            run_mode: true,
-                        });
-                        shown_at = end;
-                        until = self.frames + steps as u64;
-                    } else if let Some(t) = target {
+                let mut started = shown.walk_start;
+                let step = (pos[0] - from[0]).hypot(pos[1] - from[1]);
+                if step > 0.001 {
+                    // A step: sent at once, from where the last one ended. A walk that has just
+                    // started has its spline stretched to reach [`SEGMENT_FRAMES`] past its start;
+                    // after that each step lasts [`STEP_FRAMES`], so the next one takes over
+                    // before it ends and the run cycle never breaks.
+                    let start = started.filter(|_| self.frames <= walk_until + 1).unwrap_or(self.frames);
+                    started = Some(start);
+                    let frames_left = ((start + SEGMENT_FRAMES).saturating_sub(self.frames) as f32)
+                        .max(STEP_FRAMES);
+                    facing = wow_facing(pos[0] - from[0], pos[1] - from[1]);
+                    self.spline_id = self.spline_id.wrapping_add(1);
+                    self.moves += 1;
+                    self.emit(SessionEvent::MonsterMove {
+                        guid,
+                        transport: None,
+                        start: from,
+                        spline_id: self.spline_id,
+                        // A path starts at the wire's start point, as the packet decodes it: a
+                        // one-point path installs no spline (`monster_move_spline`).
+                        path: vec![from, pos],
+                        facing: MonsterMoveFacing::None,
+                        stop: false,
+                        duration_ms: (frames_left * TICK_MS).round() as u32,
+                        flying: false,
+                        run_mode: true,
+                    });
+                    shown_at = pos;
+                    until = self.frames + frames_left.ceil() as u64;
+                } else if self.frames >= walk_until {
+                    started = None;
+                    if let Some(t) = target {
                         // Standing: turn to the target when it is off by more than a few degrees.
                         let (tx, ty) = (t[0] - from[0], t[1] - from[1]);
                         if tx.hypot(ty) > 0.05 {
@@ -1156,6 +1126,7 @@ impl Bridge {
                     s.facing = facing;
                     s.walk_until = until;
                     s.last_dqq = pos;
+                    s.walk_start = started;
                 }
             } else {
                 let guid = self.next_creature;
@@ -1200,6 +1171,7 @@ impl Bridge {
                         walk_until: 0,
                         last_dqq: pos,
                         enemy: actor["kind"].as_str() == Some("enemy"),
+                        walk_start: None,
                     },
                 );
             }
