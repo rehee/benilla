@@ -235,17 +235,24 @@ struct Ground {
 }
 
 impl Ground {
-    fn load(around: [f32; 3]) -> Self {
+    /// The terrain tiles around `around` on WoW map `map` (any `Map.dbc` map: both continents,
+    /// instances; its directory read from `Map.dbc`).
+    fn load(map: u32, around: [f32; 3]) -> Self {
         let tiles = benilla_formats::wow_data()
             .and_then(|data| benilla_formats::open_chain(&data).ok())
             .and_then(|mut chain| {
-                benilla_formats::load_tiles_around(&mut chain, MAP_NAME, around[0], around[1], 1).ok()
+                let dir = if map == MAP_ID {
+                    MAP_NAME.to_owned()
+                } else {
+                    benilla_formats::load_map_catalog(&mut chain).ok()?.directory(map)?.to_owned()
+                };
+                benilla_formats::load_tiles_around(&mut chain, &dir, around[0], around[1], 1).ok()
             })
             .map(|v| v.into_iter().map(|(_, mesh)| mesh).collect::<Vec<_>>())
             .unwrap_or_default();
         let ground = Self { tiles };
         bevy::log::info!(
-            "exile: ground {} tiles, battlefield centre z {:.2} (configured {:.2})",
+            "exile: ground of map {map}: {} tiles, centre z {:.2} (configured {:.2})",
             ground.tiles.len(),
             ground.z(around[0], around[1], around[2]),
             around[2]
@@ -458,6 +465,9 @@ struct Bridge {
     /// on its battlefield (given up at the deadline: the default field).
     battle: [f32; 3],
     home: [f32; 3],
+    /// The WoW maps of the two (`Map.dbc` ids; user 2026-11-07: all of Azeroth).
+    battle_map: u32,
+    home_map: u32,
     prepare_due: Option<Instant>,
     /// The shown combat's heroes (`combat.begin` `heroes`): DQQ actor id → `dress` from the seed.
     heroes: HashMap<String, Value>,
@@ -496,7 +506,7 @@ impl Bridge {
             combat_due: None,
             clear_due: None,
             spline_id: 0,
-            ground: Ground::load(BATTLE_CENTER),
+            ground: Ground::load(MAP_ID, BATTLE_CENTER),
             replay_id: None,
             engaged: HashMap::new(),
             ready_first: None,
@@ -509,6 +519,8 @@ impl Bridge {
             heroes: HashMap::new(),
             battle: BATTLE_CENTER,
             home: ORIGIN,
+            battle_map: MAP_ID,
+            home_map: MAP_ID,
             prepare_due: None,
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
@@ -973,36 +985,45 @@ impl Bridge {
         if let Some(b) = battle {
             let n = |i: usize| b["center"][i].as_f64().map(|v| v as f32);
             if let (Some(x), Some(y)) = (n(0), n(1)) {
-                let centre = [x, y, n(2).unwrap_or(self.battle[2])];
-                bevy::log::info!("exile: battlefield {} ({}) at ({x:.1}, {y:.1})", b["scene"], b["map"]);
-                if (centre[0] - self.battle[0]).hypot(centre[1] - self.battle[1]) > 1.0 {
-                    self.ground = Ground::load(centre);
-                }
-                self.battle = self.ground.on_ground(centre);
+                let map = b["wowMap"].as_u64().and_then(|m| u32::try_from(m).ok()).unwrap_or(MAP_ID);
+                bevy::log::info!("exile: battlefield {} ({}) on map {map} at ({x:.1}, {y:.1})", b["scene"], b["map"]);
+                self.battle = [x, y, n(2).unwrap_or(self.battle[2])];
+                self.battle_map = map;
             }
         }
+        // The port first, so its loading screen (at least 0.5 s in Exile mode) covers the terrain
+        // read below; the player is set on the ground when the port is acked (`create_self`).
         self.emit(SessionEvent::Worldport {
-            map_id: MAP_ID,
+            map_id: self.battle_map,
             position: self.ground.on_ground(self.battle),
             orientation: 0.0,
             needs_ack: true,
         });
+        // Always read afresh: `.goto` may have moved the loaded ground elsewhere.
+        self.ground = Ground::load(self.battle_map, self.battle);
+        self.battle = self.ground.on_ground(self.battle);
         self.phase = Phase::Porting;
     }
 
     /// `.goto <x> <y> [r]` in free mode (with `r`, the flattest spot within `r` yards): the player
-    /// ported there (map 0), standing on the ground, and
+    /// ported there (`map=<id>` for another WoW map, else the current one), standing on the ground, and
     /// the spot's relief logged: the height spread over the DQQ field's square around it, to scout
     /// flat battlefields (PLAN-0006 E). Free mode returns here after a combat.
     fn goto(&mut self, args: &str) {
-        let v: Vec<f32> = args.split(|c: char| c.is_whitespace() || c == ',').filter_map(|w| w.parse().ok()).collect();
+        let words: Vec<&str> = args.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).collect();
+        // `map=<id>`: another WoW map (`Map.dbc` id; 1 Kalimdor); the current one otherwise.
+        let map = words
+            .iter()
+            .find_map(|w| w.strip_prefix("map=").and_then(|m| m.parse::<u32>().ok()))
+            .unwrap_or(self.home_map);
+        let v: Vec<f32> = words.iter().filter_map(|w| w.parse().ok()).collect();
         let (Some(&x0), Some(&y0)) = (v.first(), v.get(1)) else { return };
         // `.goto x y r`: the flattest spot within `r` yards instead (a 10-yard grid).
         let radius = v.get(2).copied().unwrap_or(0.0).clamp(0.0, 400.0);
         if self.phase != Phase::Free || self.self_guid.is_none() {
             return;
         }
-        let ground = Ground::load([x0, y0, 0.0]);
+        let ground = Ground::load(map, [x0, y0, 0.0]);
         let half = DQQ_FIELD_HALF as f32 * YARDS_PER_UNIT;
         // The height spread over the field's square around a spot (`None` with a hole in it).
         let relief = |x: f32, y: f32| -> Option<f32> {
@@ -1047,10 +1068,11 @@ impl Bridge {
         }
         let flat = relief(x, y);
         let z = ground.z(x, y, 0.0);
-        bevy::log::info!("exile: goto ({x:.1}, {y:.1}) z {z:.2}: relief {flat:?} yd over ±{half} yd");
+        bevy::log::info!("exile: goto map {map} ({x:.1}, {y:.1}) z {z:.2}: relief {flat:?} yd over ±{half} yd");
         self.ground = ground;
         self.home = [x, y, z + 0.5];
-        self.emit(SessionEvent::Worldport { map_id: MAP_ID, position: self.home, orientation: 0.0, needs_ack: true });
+        self.home_map = map;
+        self.emit(SessionEvent::Worldport { map_id: map, position: self.home, orientation: 0.0, needs_ack: true });
         self.phase = Phase::Returning;
     }
 
@@ -1081,7 +1103,7 @@ impl Bridge {
             // Back to free mode: home; the controls come back on the port's ack.
             if me.is_some() {
                 self.emit(SessionEvent::Worldport {
-                    map_id: MAP_ID,
+                    map_id: self.home_map,
                     position: self.home,
                     orientation: 0.0,
                     needs_ack: true,
