@@ -51,6 +51,14 @@ const CAST_FLAG_AMMO: u16 = 0x0020;
 const TARGET_FLAG_UNIT: u16 = 0x0002;
 /// `ItemDisplayInfo` 2414, `ArrowFlight_01` (a plain brown arrow): a shot's missile.
 const ARROW_DISPLAY: u32 = 2414;
+/// The area markers' look: `Creature\InvisibleStalker` (`CreatureDisplayInfo` 11686).
+const MARKER_DISPLAY: u32 = 11_686;
+/// Area markers' guids: creature-high guids of their own, clear of the actors'.
+const MARKER_GUID_BASE: u64 = 0xF130_0000_0080_0000;
+/// How long an area marker stands (its effect's kits play out on it).
+const MARKER_LIFE: Duration = Duration::from_secs(4);
+/// How long after an area marker is created its effect is cast (its model built first).
+const MARKER_EMBODY: Duration = Duration::from_millis(250);
 /// A thrown javelin's missile: the javelin's own look (`config/mapping/equipment.json` Javelin).
 const JAVELIN_DISPLAY: u32 = 1733;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
@@ -490,6 +498,12 @@ struct Bridge {
     heroes: HashMap<String, Value>,
     dress_items: HashMap<u32, (u32, u32, u32, u32)>,
     next_dressed: u64,
+    /// Invisible markers standing at skill areas' centres, each cast from for its effect and
+    /// removed when its time is up (PLAN-0006 D).
+    markers: Vec<(u64, Instant)>,
+    /// Area casts waiting for their marker's model ([`MARKER_EMBODY`]): (marker, spell, when).
+    marker_casts: Vec<(u64, u32, Instant)>,
+    next_marker: u64,
 }
 
 impl Bridge {
@@ -543,6 +557,9 @@ impl Bridge {
             prepare_due: None,
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
+            markers: Vec::new(),
+            marker_casts: Vec::new(),
+            next_marker: 0,
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -1139,6 +1156,16 @@ impl Bridge {
     /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
+        let (due, waiting): (Vec<_>, Vec<_>) = self.marker_casts.drain(..).partition(|c| now >= c.2);
+        self.marker_casts = waiting;
+        for (guid, spell, _) in due {
+            self.cast_go(guid, guid, spell, "area");
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = self.markers.drain(..).partition(|m| now >= m.1);
+        self.markers = kept;
+        for (guid, _) in gone {
+            self.emit(SessionEvent::ObjectDestroyed(guid));
+        }
         self.ready_check(now);
         if self.prepare_due.is_some_and(|t| now >= t) {
             bevy::log::info!("exile: no battlefield from the runtime, the default field");
@@ -1743,6 +1770,19 @@ impl Bridge {
                     self.cast_go(unit, unit, spell, action);
                 }
             }
+            // A skill's area (shape, radius, centre): its effect at the centre, sized to the
+            // radius — a fireball's burst, a corpse explosion (user 2026-11-07).
+            "SkillRangeAndTarget" if action == "area" && spell != 0 => {
+                let at = match (ev["centerX"].as_f64(), ev["centerY"].as_f64()) {
+                    (Some(x), Some(y)) => Some(self.to_world(x, y)),
+                    _ => ["target", "from"]
+                        .iter()
+                        .find_map(|k| ev[*k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.pos)),
+                };
+                let Some(at) = at else { return };
+                let scale = ev["scale"].as_f64().unwrap_or(1.0) as f32;
+                self.area_effect(at, scale, spell);
+            }
             "DamageTaken" => {
                 let Some(victim) = guid_of("target") else { return };
                 let attacker = guid_of("from").unwrap_or(victim);
@@ -1789,6 +1829,28 @@ impl Bridge {
             }
             _ => {}
         }
+    }
+
+    /// An area effect: an invisible unit (the Invisible Stalker) at `at`, scaled to the area,
+    /// casts `spell` on itself, so a self-centred nova's kits play there; gone after
+    /// [`MARKER_LIFE`].
+    fn area_effect(&mut self, at: [f32; 3], scale: f32, spell: u32) {
+        self.next_marker += 1;
+        let guid = MARKER_GUID_BASE | self.next_marker;
+        bevy::log::debug!("exile: area effect {spell} at {at:?} scale {scale}");
+        self.emit(unit_create(
+            0.0,
+            scale,
+            guid,
+            EntityKind::Unit,
+            MARKER_DISPLAY,
+            at,
+            0.0,
+            &[(FIELD_UNIT_FACTIONTEMPLATE, 35)],
+        ));
+        // The kits attach to the marker's model, which takes a moment to build.
+        self.marker_casts.push((guid, spell, Instant::now() + MARKER_EMBODY));
+        self.markers.push((guid, Instant::now() + MARKER_LIFE));
     }
 
     /// `SMSG_SPELL_GO` for a borrowed spell, unit to unit: a shot or a throw carries its ammo
