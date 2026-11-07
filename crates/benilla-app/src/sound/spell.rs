@@ -152,10 +152,16 @@ fn route_spell_kit_sounds(
     // Each unit's live loops, so a stop reaps only the kits it names.
     mut hold_loops: Local<HoldLoops>,
     mut despawned: RemovedComponents<NetEntity>,
+    index: Res<crate::net::GuidIndex>,
 ) {
     for entity in despawned.read() {
         hold_loops.0.remove(&entity); // the channels die with the source-channel despawn reaper
     }
+    // Exile deviation: a muted unit (a ray's invisible marker) rings nothing.
+    let silent = |entity: Entity| {
+        crate::net::exile_mode()
+            && index.0.iter().any(|(g, e)| *e == entity && crate::net::muted(*g))
+    };
     if events.is_empty() {
         return;
     }
@@ -180,7 +186,7 @@ fn route_spell_kit_sounds(
                 cast_hold,
                 at,
             } => {
-                if played_now.contains(&(entity, kit_sound)) {
+                if played_now.contains(&(entity, kit_sound)) || silent(entity) {
                     continue;
                 }
                 (entity, spell_id, kit_sound, cast_hold, at)
@@ -192,7 +198,12 @@ fn route_spell_kit_sounds(
                 kit_sound,
                 cast_hold,
                 at,
-            } => (entity, spell_id, kit_sound, cast_hold, Some(at)),
+            } => {
+                if silent(entity) {
+                    continue;
+                }
+                (entity, spell_id, kit_sound, cast_hold, Some(at))
+            }
             SpellKitSound::PlayAt { pos, kit_sound } => {
                 // A bare positional one-shot with no owner or dedup: its one caller is a
                 // missile's ground arrival.

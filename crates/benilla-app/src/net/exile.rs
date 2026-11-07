@@ -1193,6 +1193,7 @@ impl Bridge {
         self.markers = kept;
         for (guid, _) in gone {
             super::set_beam_tint(guid, None);
+            super::set_muted(guid, false);
             self.emit(SessionEvent::ObjectDestroyed(guid));
         }
         self.ready_check(now);
@@ -1857,6 +1858,9 @@ impl Bridge {
                     [0, 1, 2].map(|i| c[i].as_f64().unwrap_or(1.0) as f32)
                 });
                 super::set_beam_tint(a, tint);
+                // The ray borrows a beam's look, not its sound: the caster's cast carries that.
+                super::set_muted(a, true);
+                super::set_muted(b, true);
                 if ev["channel"].as_bool() == Some(true) {
                     // A channel beam (Mind Flay): the start marker channels the spell at the end
                     // one (`UNIT_FIELD_CHANNEL_OBJECT` + `UNIT_CHANNEL_SPELL`); the channel poll

@@ -55,6 +55,25 @@ pub(crate) fn set_beam_tint(guid: u64, tint: Option<[f32; 3]>) {
     }
 }
 
+/// Exile's silent units (PLAN-0006 D): a ray's invisible markers play their borrowed spell's
+/// visuals but not its sounds (a frost ray must not crackle like the beam it borrows); the caster's
+/// own cast carries the skill's sound.
+static MUTED: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_muted(guid: u64, muted: bool) {
+    let mut set = MUTED.lock().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(Default::default);
+    if muted {
+        set.insert(guid);
+    } else {
+        set.remove(&guid);
+    }
+}
+
+pub(crate) fn muted(guid: u64) -> bool {
+    MUTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&guid))
+}
+
 pub(crate) fn beam_tint(guid: u64) -> Option<[f32; 3]> {
     BEAM_TINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&guid).copied()
 }
