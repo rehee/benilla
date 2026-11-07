@@ -65,6 +65,9 @@ const PROJECTILE_HEIGHT: f32 = 1.2;
 const PROJECTILE_LINGER: Duration = Duration::from_millis(800);
 /// `UNIT_FIELD_CHANNEL_OBJECT` (a guid, two words from field 20); the protocol keeps its name private.
 const FIELD_UNIT_CHANNEL_OBJECT_LO: u16 = 20;
+/// A channel holds this long past its skill's last event (§2.2: a gap of a few frames does not
+/// break it).
+const CHANNEL_HOLD: Duration = Duration::from_millis(800);
 /// How long a ray's markers stand: a channel beam (Mind Flay) shows until its caster goes.
 const RAY_LIFE: Duration = Duration::from_millis(900);
 /// How long after an area marker is created its effect is cast (its model built first).
@@ -515,6 +518,9 @@ struct Bridge {
     marker_casts: Vec<(u64, u64, u32, Instant)>,
     /// Channels waiting for their marker's model: (channeller, channel object, spell, when).
     marker_channels: Vec<(u64, u64, u32, Instant)>,
+    /// Units channelling a skill (PLAN-0006 D §2.2): unit → (channel spell, held until). Each of
+    /// the skill's events pushes the end out; the channel stops [`CHANNEL_HOLD`] after the last.
+    channels: HashMap<u64, (u32, Instant)>,
     next_marker: u64,
     /// DQQ projectiles in flight (PLAN-0006 D): id → (launch marker, flying marker, position).
     projectiles: HashMap<String, (u64, u64, [f32; 3])>,
@@ -574,6 +580,7 @@ impl Bridge {
             markers: Vec::new(),
             marker_casts: Vec::new(),
             marker_channels: Vec::new(),
+            channels: HashMap::new(),
             next_marker: 0,
             projectiles: HashMap::new(),
             ready_quiet: None,
@@ -1177,6 +1184,14 @@ impl Bridge {
         for (caster, target, spell, _) in due {
             self.cast_go(caster, target, spell, "marker");
         }
+        let ended: Vec<u64> = self.channels.iter().filter(|(_, c)| now >= c.1).map(|(g, _)| *g).collect();
+        for unit in ended {
+            self.channels.remove(&unit);
+            self.emit(SessionEvent::ObjectValues {
+                guid: unit,
+                fields: ObjectFields::from_pairs(&[(FIELD_UNIT_CHANNEL_SPELL, 0)]),
+            });
+        }
         let (due, waiting): (Vec<_>, Vec<_>) = self.marker_channels.drain(..).partition(|c| now >= c.3);
         self.marker_channels = waiting;
         for (caster, object, spell, _) in due {
@@ -1778,12 +1793,23 @@ impl Bridge {
         if ev["success"].as_bool() == Some(false) {
             return;
         }
-        let guid_of = |k: &str| ev[k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
         let action = ev["action"].as_str().unwrap_or("none");
         let spell = ev["spell"].as_u64().unwrap_or(0) as u32;
         let school = ev["school"].as_u64().unwrap_or(0) as u8;
         let crit = ev["critical"].as_bool() == Some(true);
         let amount = ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32;
+        // A channel (§2.2): the caster holds the channel spell's directed channel pose while the
+        // skill's events keep coming, and stops a moment after the last.
+        if action == "channel" && spell != 0 && matches!(ev["kind"].as_str(), Some("CastSkill" | "DamageTaken")) {
+            let caster = ev["from"].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
+            if let Some(caster) = caster {
+                self.hold_channel(caster, spell);
+            }
+            if ev["kind"].as_str() == Some("CastSkill") {
+                return;
+            }
+        }
+        let guid_of = |k: &str| ev[k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
         match ev["kind"].as_str().unwrap_or("") {
             // The cast (Cast / Launch phase): the spell's cast animation, self kit and missile.
             "CastSkill" | "ActiveAura" => {
@@ -2026,6 +2052,22 @@ impl Bridge {
         // The kits attach to the marker's model, which takes a moment to build.
         self.marker_casts.push((guid, guid, spell, Instant::now() + MARKER_EMBODY));
         self.markers.push((guid, Instant::now() + MARKER_LIFE));
+    }
+
+    /// Starts or extends `unit`'s channel of `spell` (`UNIT_CHANNEL_SPELL`: the channel poll plays
+    /// its channel kit, the held pose and hand effects, until the field clears).
+    fn hold_channel(&mut self, unit: u64, spell: u32) {
+        let until = Instant::now() + CHANNEL_HOLD;
+        match self.channels.get_mut(&unit) {
+            Some(c) if c.0 == spell => c.1 = until,
+            _ => {
+                self.channels.insert(unit, (spell, until));
+                self.emit(SessionEvent::ObjectValues {
+                    guid: unit,
+                    fields: ObjectFields::from_pairs(&[(FIELD_UNIT_CHANNEL_SPELL, spell)]),
+                });
+            }
+        }
     }
 
     /// A borrowed spell's cast alone: `SMSG_SPELL_GO` with no unit hit, so its cast animation and
