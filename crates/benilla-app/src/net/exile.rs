@@ -10,14 +10,14 @@
 //!
 //! Exile 模式：不连 WoW 服务器，由 Exile Runtime 经本机 WebSocket 驱动客户端（本仓库为 rehee/benilla 分支）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use benilla_protocol::field::{
-    FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
+    FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_FLAGS, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
     FIELD_UNIT_MAXHEALTH,
 };
 use benilla_protocol::messages::{
@@ -57,6 +57,14 @@ const MARKER_DISPLAY: u32 = 11_686;
 const MARKER_GUID_BASE: u64 = 0xF130_0000_0080_0000;
 /// How long an area marker stands (its effect's kits play out on it).
 const MARKER_LIFE: Duration = Duration::from_secs(4);
+/// Markers can't be targeted or hit: `UNIT_FLAG_NOT_SELECTABLE` (bit 25) | `NON_ATTACKABLE` (0x2).
+const MARKER_FLAGS: u32 = 0x0200_0000 | 0x2;
+/// A DQQ projectile's missile flies this far above the ground (chest height), yards.
+const PROJECTILE_HEIGHT: f32 = 1.2;
+/// A finished projectile's markers stay this long, for the missile to land.
+const PROJECTILE_LINGER: Duration = Duration::from_millis(800);
+/// How long a ray's markers stand: a channel beam (Mind Flay) shows until its caster goes.
+const RAY_LIFE: Duration = Duration::from_millis(900);
 /// How long after an area marker is created its effect is cast (its model built first).
 const MARKER_EMBODY: Duration = Duration::from_millis(250);
 /// A thrown javelin's missile: the javelin's own look (`config/mapping/equipment.json` Javelin).
@@ -490,7 +498,7 @@ struct Bridge {
     home_map: u32,
     /// Units whose only weapon is ranged (a bow in the ranged slot): they fight with it drawn
     /// (sheath state 2, the bow in the left hand), not a melee draw.
-    ranged: std::collections::HashSet<u64>,
+    ranged: HashSet<u64>,
     /// `.replay <scene>`: the next trip's battlefield scene, over the recording's own.
     scene_override: Option<String>,
     prepare_due: Option<Instant>,
@@ -501,9 +509,11 @@ struct Bridge {
     /// Invisible markers standing at skill areas' centres, each cast from for its effect and
     /// removed when its time is up (PLAN-0006 D).
     markers: Vec<(u64, Instant)>,
-    /// Area casts waiting for their marker's model ([`MARKER_EMBODY`]): (marker, spell, when).
-    marker_casts: Vec<(u64, u32, Instant)>,
+    /// Casts waiting for their marker's model ([`MARKER_EMBODY`]): (caster, target, spell, when).
+    marker_casts: Vec<(u64, u64, u32, Instant)>,
     next_marker: u64,
+    /// DQQ projectiles in flight (PLAN-0006 D): id → (launch marker, flying marker, position).
+    projectiles: HashMap<String, (u64, u64, [f32; 3])>,
 }
 
 impl Bridge {
@@ -560,6 +570,7 @@ impl Bridge {
             markers: Vec::new(),
             marker_casts: Vec::new(),
             next_marker: 0,
+            projectiles: HashMap::new(),
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -1156,14 +1167,15 @@ impl Bridge {
     /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
-        let (due, waiting): (Vec<_>, Vec<_>) = self.marker_casts.drain(..).partition(|c| now >= c.2);
+        let (due, waiting): (Vec<_>, Vec<_>) = self.marker_casts.drain(..).partition(|c| now >= c.3);
         self.marker_casts = waiting;
-        for (guid, spell, _) in due {
-            self.cast_go(guid, guid, spell, "area");
+        for (caster, target, spell, _) in due {
+            self.cast_go(caster, target, spell, "marker");
         }
         let (gone, kept): (Vec<_>, Vec<_>) = self.markers.drain(..).partition(|m| now >= m.1);
         self.markers = kept;
         for (guid, _) in gone {
+            super::set_beam_tint(guid, None);
             self.emit(SessionEvent::ObjectDestroyed(guid));
         }
         self.ready_check(now);
@@ -1733,6 +1745,7 @@ impl Bridge {
             }
         }
         self.keep_engaged();
+        self.projectiles(data);
         for ev in data["events"].as_array().into_iter().flatten() {
             self.play_event(ev);
         }
@@ -1761,6 +1774,11 @@ impl Bridge {
                     return;
                 }
                 let target = guid_of("target").unwrap_or(caster);
+                if ev["hit"].as_bool() == Some(false) {
+                    // Only the cast (a fire nova's own burst does no harm: user 2026-11-07).
+                    self.cast_only(caster, spell);
+                    return;
+                }
                 self.cast_go(caster, target, spell, action);
             }
             // A duration appeared: its start spell on the unit wearing it (warcry, the beam
@@ -1782,6 +1800,51 @@ impl Bridge {
                 let Some(at) = at else { return };
                 let scale = ev["scale"].as_f64().unwrap_or(1.0) as f32;
                 self.area_effect(at, scale, spell);
+            }
+            // A scatter's ray (user 2026-11-07): from where the scatter starts — the area's centre,
+            // a fireball's burst — to where it ends (the unit it reaches, else the area's edge), its
+            // look by the skill's tags. A marker at each end; the start casts the ray at the end.
+            "SkillRangeAndTarget" if action == "ray" && spell != 0 => {
+                let caster = ev["from"].as_str().and_then(|id| self.shown.get(id)).map(|s| (s.pos, s.facing));
+                let start = match (ev["centerX"].as_f64(), ev["centerY"].as_f64()) {
+                    (Some(x), Some(y)) => self.to_world(x, y),
+                    _ => match caster {
+                        Some((p, _)) => p,
+                        None => return,
+                    },
+                };
+                let range = ev["range"].as_f64().unwrap_or(0.0) as f32 * YARDS_PER_UNIT;
+                let end = match (ev["endX"].as_f64(), ev["endY"].as_f64()) {
+                    (Some(x), Some(y)) => Some(self.to_world(x, y)),
+                    _ => ev["target"].as_str().and_then(|id| self.shown.get(id)).map(|s| s.pos),
+                };
+                let end = match end {
+                    Some(p) if (p[0] - start[0]).hypot(p[1] - start[1]) > 0.5 => p,
+                    _ => {
+                        let facing = caster.map_or(0.0, |c| c.1);
+                        self.ground.on_ground([
+                            start[0] + facing.cos() * range,
+                            start[1] + facing.sin() * range,
+                            start[2],
+                        ])
+                    }
+                };
+                let lift = |mut p: [f32; 3]| {
+                    p[2] += PROJECTILE_HEIGHT;
+                    p
+                };
+                let a = self.marker_at(lift(start), 1.0);
+                let b = self.marker_at(lift(end), 1.0);
+                // A beam's colour by the skill's tags (`skills.json` rays … color).
+                let tint = ev["color"].as_array().filter(|c| c.len() == 3).map(|c| {
+                    [0, 1, 2].map(|i| c[i].as_f64().unwrap_or(1.0) as f32)
+                });
+                super::set_beam_tint(a, tint);
+                self.marker_casts.push((a, b, spell, Instant::now() + MARKER_EMBODY));
+                // A channel's beam lasts while its caster stands: the ray's markers go soon.
+                let gone = Instant::now() + RAY_LIFE;
+                self.markers.push((a, gone));
+                self.markers.push((b, gone));
             }
             "DamageTaken" => {
                 let Some(victim) = guid_of("target") else { return };
@@ -1831,6 +1894,84 @@ impl Bridge {
         }
     }
 
+    /// DQQ's projectiles (`projects[]`), each drawn as its borrowed spell's missile: a marker
+    /// where it was launched casts the spell at a second marker that rides the projectile's DQQ
+    /// path, so the missile homes along it and bursts where it ends (PLAN-0006 D). A projectile
+    /// with no spell (a bow's arrow, drawn by its shot) is not drawn.
+    fn projectiles(&mut self, data: &Value) {
+        let mut seen = HashSet::new();
+        for p in data["projects"].as_array().into_iter().flatten() {
+            let (Some(id), Some(x), Some(y)) = (p["id"].as_str(), p["x"].as_f64(), p["y"].as_f64()) else {
+                continue;
+            };
+            let spell = p["spell"].as_u64().unwrap_or(0) as u32;
+            if spell == 0 {
+                continue;
+            }
+            seen.insert(id.to_owned());
+            let mut pos = self.to_world(x, y);
+            pos[2] += PROJECTILE_HEIGHT;
+            if let Some(&(_, b, last)) = self.projectiles.get(id) {
+                if last != pos {
+                    self.spline_id = self.spline_id.wrapping_add(1);
+                    self.emit(SessionEvent::MonsterMove {
+                        guid: b,
+                        transport: None,
+                        start: last,
+                        spline_id: self.spline_id,
+                        path: vec![last, pos],
+                        facing: MonsterMoveFacing::None,
+                        stop: false,
+                        duration_ms: TICK_MS.round() as u32,
+                        flying: true,
+                        run_mode: true,
+                    });
+                    if let Some(e) = self.projectiles.get_mut(id) {
+                        e.2 = pos;
+                    }
+                }
+                continue;
+            }
+            let a = self.marker_at(pos, 1.0);
+            let b = self.marker_at(pos, 1.0);
+            // The missile flies from the launch marker to the one riding the path.
+            self.marker_casts.push((a, b, spell, Instant::now() + MARKER_EMBODY));
+            self.projectiles.insert(id.to_owned(), (a, b, pos));
+        }
+        let gone: Vec<String> = self.projectiles.keys().filter(|k| !seen.contains(*k)).cloned().collect();
+        for id in gone {
+            if let Some((a, b, _)) = self.projectiles.remove(&id) {
+                // Left standing a moment: the missile still homing on `b` lands first.
+                let at = Instant::now() + PROJECTILE_LINGER;
+                self.markers.push((a, at));
+                self.markers.push((b, at));
+            }
+        }
+    }
+
+    /// An invisible marker unit standing at `pos` (not yet scheduled for removal).
+    fn marker_at(&mut self, pos: [f32; 3], scale: f32) -> u64 {
+        self.next_marker += 1;
+        let guid = MARKER_GUID_BASE | self.next_marker;
+        self.emit(unit_create(
+            0.0,
+            scale,
+            guid,
+            EntityKind::Unit,
+            MARKER_DISPLAY,
+            pos,
+            0.0,
+            // Alive, out of reach: UNIT_FLAG_NOT_SELECTABLE | NON_ATTACKABLE.
+            &[
+                (FIELD_UNIT_FACTIONTEMPLATE, 35),
+                (FIELD_UNIT_HEALTH, 1),
+                (FIELD_UNIT_MAXHEALTH, 1),
+                (FIELD_UNIT_FLAGS, MARKER_FLAGS),
+            ],
+        ));
+        guid
+    }
+
     /// An area effect: an invisible unit (the Invisible Stalker) at `at`, scaled to the area,
     /// casts `spell` on itself, so a self-centred nova's kits play there; gone after
     /// [`MARKER_LIFE`].
@@ -1846,11 +1987,37 @@ impl Bridge {
             MARKER_DISPLAY,
             at,
             0.0,
-            &[(FIELD_UNIT_FACTIONTEMPLATE, 35)],
+            // Alive, out of reach: UNIT_FLAG_NOT_SELECTABLE | NON_ATTACKABLE.
+            &[
+                (FIELD_UNIT_FACTIONTEMPLATE, 35),
+                (FIELD_UNIT_HEALTH, 1),
+                (FIELD_UNIT_MAXHEALTH, 1),
+                (FIELD_UNIT_FLAGS, MARKER_FLAGS),
+            ],
         ));
         // The kits attach to the marker's model, which takes a moment to build.
-        self.marker_casts.push((guid, spell, Instant::now() + MARKER_EMBODY));
+        self.marker_casts.push((guid, guid, spell, Instant::now() + MARKER_EMBODY));
         self.markers.push((guid, Instant::now() + MARKER_LIFE));
+    }
+
+    /// A borrowed spell's cast alone: `SMSG_SPELL_GO` with no unit hit, so its cast animation and
+    /// cast kit play and no impact does.
+    fn cast_only(&mut self, caster: u64, spell: u32) {
+        self.emit(SessionEvent::SpellGo {
+            caster,
+            spell_id: spell,
+            cast_flags: 0,
+            hits: Vec::new(),
+            misses: Vec::new(),
+            target: None,
+            go_target: None,
+            target_mask: 0,
+            source: None,
+            dest: None,
+            ammo_display_id: None,
+            item_caster: None,
+            unit_caster: caster,
+        });
     }
 
     /// `SMSG_SPELL_GO` for a borrowed spell, unit to unit: a shot or a throw carries its ammo

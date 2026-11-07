@@ -100,6 +100,9 @@ pub(crate) struct ChainBeam {
     expiry: f32,
     /// The texture-scroll accumulator in seconds (`+0x60`).
     phase: f32,
+    /// Exile deviation: the vertex colour, white (the reference's constant) unless an Exile ray
+    /// names a tint for its caster (`crate::net::beam_tint`).
+    tint: [f32; 4],
     rng: u32,
 }
 
@@ -267,6 +270,12 @@ pub(super) fn spawn_chain_beams(
                 dest_tag,
                 persistent: play.proc.flag,
                 phase: 0.0,
+                tint: index
+                    .0
+                    .iter()
+                    .find(|(_, e)| **e == play.entity)
+                    .and_then(|(g, _)| crate::net::beam_tint(*g))
+                    .map_or([1.0; 4], |t| [t[0], t[1], t[2], 1.0]),
                 // Per-beam seed, so neighbouring beams never draw the same jitter on one frame.
                 rng: 0x9E37_79B9 ^ (play.spell_id.wrapping_mul(2654435761)),
             },
@@ -327,6 +336,7 @@ fn push_strand(
     half_width: f32,
     u_scroll: f32,
     cam_forward: Vec3,
+    tint: [f32; 4],
 ) {
     let count = pts.len();
     if count < 2 {
@@ -352,7 +362,7 @@ fn push_strand(
             (pts[i] + off, pts[i] - off, 0.0)
         }
     };
-    let white = [1.0, 1.0, 1.0, 1.0];
+    let white = tint;
     let span = (count - 1) as f32;
     let mut a = rail(0);
     for i in 0..count - 1 {
@@ -411,11 +421,12 @@ pub(crate) fn simulate_chain_beams(
         if !images.contains(&beam.texture) {
             continue; // texture not resident yet
         }
-        let (dest_tag, half_width, persistent, texture) = (
+        let (dest_tag, half_width, persistent, texture, tint) = (
             beam.dest_tag,
             beam.effect.half_width,
             beam.persistent,
             beam.texture.id(),
+            beam.tint,
         );
         let ChainBeam {
             nodes,
@@ -465,7 +476,7 @@ pub(crate) fn simulate_chain_beams(
                     pts.clear();
                     pts.extend_from_slice(&scratch);
                 }
-                push_strand(batch.verts_mut(), pts, half_width, u_scroll, cam_forward);
+                push_strand(batch.verts_mut(), pts, half_width, u_scroll, cam_forward, tint);
             }
         }
         if anchor_n == 0.0 {
@@ -637,7 +648,7 @@ mod tests {
         // A camera off to the side, looking along −X at a hop that runs along −Z.
         let cam_forward = -Vec3::X;
         let mut verts = Vec::new();
-        push_strand(&mut verts, &pts, 0.5, 0.0, cam_forward);
+        push_strand(&mut verts, &pts, 0.5, 0.0, cam_forward, [1.0; 4]);
         assert_eq!(verts.len(), 8);
         // Quad corner order is [b₀, b₁, t₁, t₀]: the first quad's b₀/t₀ are the collapsed caster
         // end, and the second's b₁/t₁ the collapsed target end.
@@ -668,7 +679,7 @@ mod tests {
         ] {
             let cam_forward = cam_forward.normalize();
             let mut verts = Vec::new();
-            push_strand(&mut verts, &pts, 0.5, 0.0, cam_forward);
+            push_strand(&mut verts, &pts, 0.5, 0.0, cam_forward, [1.0; 4]);
             let (mid_bottom, mid_top) = (Vec3::from(verts[1].pos), Vec3::from(verts[2].pos));
             let across = mid_top - mid_bottom;
             assert!(
@@ -688,7 +699,7 @@ mod tests {
         // Camera at the origin looking along −Z with +Y up: a hop along +X runs left→right.
         let pts = [Vec3::ZERO, Vec3::X * 5.0, Vec3::X * 10.0];
         let mut verts = Vec::new();
-        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z);
+        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z, [1.0; 4]);
         // Quad corner order is [b₀, b₁, t₁, t₀]; index 2 is the mid point's `t` rail.
         let (mid_bottom, mid_top) = (Vec3::from(verts[1].pos), Vec3::from(verts[2].pos));
         assert_eq!(verts[2].uv[1], 0.0, "the t rail is v = 0");
@@ -702,7 +713,7 @@ mod tests {
     fn a_hop_aimed_at_the_camera_collapses_instead_of_exploding() {
         let pts = [Vec3::ZERO, Vec3::Y * 5.0, Vec3::Y * 10.0];
         let mut verts = Vec::new();
-        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Y);
+        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Y, [1.0; 4]);
         let (mid_bottom, mid_top) = (Vec3::from(verts[1].pos), Vec3::from(verts[2].pos));
         assert!(
             mid_top.distance(mid_bottom) < 1e-6,
@@ -711,7 +722,7 @@ mod tests {
         assert!(verts.iter().all(|v| v.pos.iter().all(|c| c.is_finite())));
 
         verts.clear();
-        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z);
+        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z, [1.0; 4]);
         let (mid_bottom, mid_top) = (Vec3::from(verts[1].pos), Vec3::from(verts[2].pos));
         assert!(
             (mid_top.distance(mid_bottom) - 1.0).abs() < 1e-5,
@@ -724,11 +735,11 @@ mod tests {
     fn u_runs_caster_to_target_and_the_scroll_translates_it() {
         let pts = [Vec3::ZERO, Vec3::X * 5.0, Vec3::X * 10.0];
         let mut verts = Vec::new();
-        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z);
+        push_strand(&mut verts, &pts, 0.5, 0.0, Vec3::NEG_Z, [1.0; 4]);
         assert_eq!(verts[0].uv[0], 0.0, "caster end");
         assert_eq!(verts[5].uv[0], 1.0, "target end");
         verts.clear();
-        push_strand(&mut verts, &pts, 0.5, -0.25, Vec3::NEG_Z);
+        push_strand(&mut verts, &pts, 0.5, -0.25, Vec3::NEG_Z, [1.0; 4]);
         assert_eq!(
             verts[0].uv[0], -0.25,
             "the whole run slides with the scroll"

@@ -38,6 +38,27 @@ pub(crate) fn exile_spectating() -> bool {
     EXILE_SPECTATING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Exile's beam tints (PLAN-0006 D): a ray's caster guid → the RGB its beam texture is multiplied
+/// by (additive blend, so above 1 brightens). The stock client never tints a chain beam.
+static BEAM_TINTS: std::sync::Mutex<Option<HashMap<u64, [f32; 3]>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_beam_tint(guid: u64, tint: Option<[f32; 3]>) {
+    let mut map = BEAM_TINTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match tint {
+        Some(t) => {
+            map.insert(guid, t);
+        }
+        None => {
+            map.remove(&guid);
+        }
+    }
+}
+
+pub(crate) fn beam_tint(guid: u64) -> Option<[f32; 3]> {
+    BEAM_TINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&guid).copied()
+}
+
 fn set_exile_spectating(on: bool) {
     EXILE_SPECTATING.store(on, std::sync::atomic::Ordering::Relaxed);
 }
