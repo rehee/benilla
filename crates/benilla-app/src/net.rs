@@ -102,6 +102,9 @@ impl Plugin for NetPlugin {
         world::register(app);
         session::register(app);
         objects::register(app);
+        if exile_mode() {
+            app.add_systems(Update, exile::count_unembodied);
+        }
         crate::names::net::register(app);
         app.insert_resource(NetEvents(handles.events))
             .insert_resource(NetCommands(handles.commands))

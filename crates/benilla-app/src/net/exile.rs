@@ -11,7 +11,7 @@
 //! Exile 模式：不连 WoW 服务器，由 Exile Runtime 经本机 WebSocket 驱动客户端（本仓库为 rehee/benilla 分支）。
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +37,8 @@ use super::{CharRequest, ClientCommand, LoginRequest, ParkRequest, ParkSender, R
 /// `OBJECT_FIELD_TYPE` (2), `UNIT_FIELD_BYTES_0` (36: race, class, gender, power type) and
 /// `UNIT_FIELD_NATIVEDISPLAYID` (132), 1.12.1 indices.
 const FIELD_OBJECT_TYPE: u16 = 2;
+/// `OBJECT_FIELD_SCALE_X` (4), the complete render scale, a float.
+const FIELD_OBJECT_SCALE_X: u16 = 4;
 const FIELD_UNIT_BYTES_0: u16 = 36;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
 /// Human faction template (friendly to the player) and a hostile one for enemies.
@@ -54,6 +56,24 @@ const BATTLE_CENTER: [f32; 3] = [-8934.95, -117.49, 83.6];
 const DQQ_FIELD_HALF: f64 = 5.0;
 const YARDS_PER_UNIT: f32 = 2.0;
 
+
+/// Units and players whose model has not built yet ([`count_unembodied`]): a combat's start
+/// waits for it to reach zero before the runtime runs on ([`Bridge::ready_check`]).
+static UNEMBODIED: AtomicU32 = AtomicU32::new(0);
+
+/// Each frame, the units and players still without a model.
+pub(super) fn count_unembodied(
+    units: bevy::prelude::Query<
+        &super::NetEntity,
+        bevy::prelude::Without<benilla_assets::ModelAnimations>,
+    >,
+) {
+    let n = units
+        .iter()
+        .filter(|n| matches!(n.kind, EntityKind::Unit | EntityKind::Player))
+        .count();
+    UNEMBODIED.store(n as u32, Ordering::Relaxed);
+}
 
 /// Is Exile mode on? `EXILE_RUNTIME` names the runtime's WebSocket.
 pub(super) fn runtime_url() -> Option<String> {
@@ -165,6 +185,8 @@ struct Shown {
     walk_until: u64,
     /// Where DQQ had the actor last frame, and its `moving` flag then (the flag census).
     last_dqq: [f32; 3],
+    /// A DQQ enemy (else the hero's side).
+    enemy: bool,
 }
 
 /// A walk is shown in segments of this many frames (user rule, 2026-11-06): a walk that starts
@@ -239,6 +261,10 @@ enum Phase {
     /// The way home: control returns when the client acks that port.
     Returning,
 }
+/// The combat's start hold: at least, the models' fade-in after the last one builds, at most.
+const READY_MIN: Duration = Duration::from_millis(2500);
+const READY_SETTLE: Duration = Duration::from_millis(800);
+const READY_MAX: Duration = Duration::from_secs(10);
 /// How long a finished combat's units stay before they are removed.
 const CLEAR_DELAY: Duration = Duration::from_secs(3);
 
@@ -247,19 +273,61 @@ const CLEAR_DELAY: Duration = Duration::from_secs(3);
 /// character-model NPC; any other key the first textured creature whose model path contains it.
 struct ModelBook {
     catalog: Option<benilla_formats::CreatureCatalog>,
+    /// The install's archives, for the models' bounds ([`Self::footprint`]).
+    chain: Option<benilla_formats::Chain>,
     resolved: HashMap<String, u32>,
+    /// Each display's footprint at scale 1, yards (`None`: unreadable).
+    footprints: HashMap<u32, Option<f32>>,
 }
 
 impl ModelBook {
     fn load() -> Self {
-        let catalog = benilla_formats::wow_data()
-            .and_then(|data| benilla_formats::open_chain(&data).ok())
-            .and_then(|mut chain| benilla_formats::load_creature_catalog(&mut chain).ok());
+        let mut chain = benilla_formats::wow_data()
+            .and_then(|data| benilla_formats::open_chain(&data).ok());
+        let catalog = chain
+            .as_mut()
+            .and_then(|chain| benilla_formats::load_creature_catalog(chain).ok());
         bevy::log::info!(
             "exile: creature catalog {}",
             catalog.as_ref().map_or(0, benilla_formats::CreatureCatalog::len)
         );
-        Self { catalog, resolved: HashMap::new() }
+        Self { catalog, chain, resolved: HashMap::new(), footprints: HashMap::new() }
+    }
+
+    /// A display's footprint at `OBJECT_FIELD_SCALE_X` 1: the larger horizontal extent of its
+    /// model's bounding box, yards.
+    fn footprint(&mut self, display: u32) -> Option<f32> {
+        if let Some(fp) = self.footprints.get(&display) {
+            return *fp;
+        }
+        let path = self.catalog.as_ref().and_then(|c| c.model(display)).map(|m| m.model_path);
+        let fp = path.and_then(|path| {
+            let b = benilla_formats::load_m2_bounds(self.chain.as_mut()?, &path).ok()?;
+            let w = (b.bbox_max[0] - b.bbox_min[0]).abs().max((b.bbox_max[1] - b.bbox_min[1]).abs());
+            (w > 0.0).then_some(w)
+        });
+        let id = display;
+        bevy::log::info!("exile: display {id} footprint {fp:?} yd at scale 1");
+        self.footprints.insert(display, fp);
+        fp
+    }
+
+    /// A creature's render scale (`OBJECT_FIELD_SCALE_X`) for a DQQ actor of `size` (its radius
+    /// over a human's, user 2026-11-06): the display's own scale (`modelScale × creatureModelScale`,
+    /// which a server folds into the field) times the size; then, unless `oversize` (a specially
+    /// marked monster), cut so the model covers at most `size × YARDS_PER_UNIT` yards each way.
+    fn unit_scale(&mut self, display: u32, size: f32, oversize: bool) -> f32 {
+        let natural = self.catalog.as_ref().and_then(|c| c.model_scale(display)).unwrap_or(1.0);
+        let mut scale = natural * size;
+        if !oversize {
+            if let Some(fp) = self.footprint(display) {
+                let (covered, cap) = (fp * scale, size * YARDS_PER_UNIT);
+                if covered > cap {
+                    scale *= cap / covered;
+                }
+            }
+        }
+        scale
     }
 
     fn resolve(&mut self, key: &str) -> u32 {
@@ -329,6 +397,14 @@ struct Bridge {
     clear_due: Option<Instant>,
     spline_id: u32,
     ground: Ground,
+    /// The combat's start hold: when its first frame was shown (the runtime waits on
+    /// `combat.ready`), and since when every model has been built.
+    ready_first: Option<Instant>,
+    ready_quiet: Option<Instant>,
+    /// `combat.ready` sent, or no hold under way.
+    ready_sent: bool,
+    /// Each combat unit's attack target, for the combat stance ([`Self::keep_engaged`]).
+    engaged: HashMap<u64, u64>,
     /// The recording the next replay trip plays (`None`: the character's latest).
     replay_id: Option<String>,
     /// Or the recording file it plays (`replays/`, runtime `ReplayFiles`).
@@ -379,6 +455,10 @@ impl Bridge {
             spline_id: 0,
             ground: Ground::load(BATTLE_CENTER),
             replay_id: None,
+            engaged: HashMap::new(),
+            ready_first: None,
+            ready_quiet: None,
+            ready_sent: true,
             replay_file: None,
             frames: 0,
             moves: 0,
@@ -476,7 +556,13 @@ impl Bridge {
                     let file = self.replay_file.take();
                     self.send(
                         "combat.replay",
-                        json!({ "replayId": replay, "file": file, "characterId": id, "mode": "watch" }),
+                        json!({
+                            "replayId": replay,
+                            "file": file,
+                            "characterId": id,
+                            "mode": "watch",
+                            "hold": true,
+                        }),
                     );
                     self.phase = Phase::Combat;
                 }
@@ -618,6 +704,7 @@ impl Bridge {
     /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
+        self.ready_check(now);
         if self.combat_due.is_some_and(|t| now >= t) {
             self.combat_due = None;
             self.start_replay();
@@ -625,6 +712,11 @@ impl Bridge {
         let me = self.self_guid;
         if self.clear_due.is_some_and(|t| now >= t) {
             self.clear_due = None;
+            // The hero leaves the combat stance before the way home.
+            if let Some((me, victim)) = me.and_then(|m| self.engaged.get(&m).map(|v| (m, *v))) {
+                self.emit(SessionEvent::AttackStop { attacker: me, victim });
+            }
+            self.engaged.clear();
             let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
             for guid in guids {
                 self.emit(SessionEvent::ObjectDestroyed(guid));
@@ -640,6 +732,60 @@ impl Bridge {
             }
             self.focus = None;
             self.phase = Phase::Returning;
+        }
+    }
+
+    /// Every unit in a combat holds the combat stance (user, 2026-11-07): engaged, as an attack
+    /// start leaves it (`SMSG_ATTACKSTART`), so it idles in the Ready pose, not the peaceful stand.
+    /// An enemy engages the nearest of the hero's side, the hero's side the nearest enemy; a unit
+    /// keeps its victim while that lives.
+    fn keep_engaged(&mut self) {
+        let units: Vec<(u64, [f32; 3], bool)> =
+            self.shown.values().map(|s| (s.guid, s.pos, s.enemy)).collect();
+        for &(guid, pos, enemy) in &units {
+            if self.engaged.get(&guid).is_some_and(|v| units.iter().any(|u| u.0 == *v)) {
+                continue;
+            }
+            let nearest = units
+                .iter()
+                .filter(|u| u.2 != enemy)
+                .min_by(|a, b| {
+                    let da = (a.1[0] - pos[0]).hypot(a.1[1] - pos[1]);
+                    let db = (b.1[0] - pos[0]).hypot(b.1[1] - pos[1]);
+                    da.total_cmp(&db)
+                })
+                .map(|u| u.0);
+            if let Some(victim) = nearest {
+                self.engaged.insert(guid, victim);
+                self.emit(SessionEvent::AttackStart { attacker: guid, victim });
+            }
+        }
+    }
+
+    /// The combat's start hold (user, 2026-11-07): the first frame's units are created, then the
+    /// runtime waits until every model is built (and [`READY_SETTLE`] more, for the fade-in),
+    /// at least [`READY_MIN`] and at most [`READY_MAX`]; `combat.ready` lets it run.
+    fn ready_check(&mut self, now: Instant) {
+        if self.ready_sent {
+            return;
+        }
+        let Some(first) = self.ready_first else { return };
+        let pending = UNEMBODIED.load(Ordering::Relaxed);
+        if pending == 0 {
+            self.ready_quiet.get_or_insert(now);
+        } else {
+            self.ready_quiet = None;
+        }
+        let settled = self.ready_quiet.is_some_and(|q| now - q >= READY_SETTLE);
+        let waited = now - first;
+        if (settled && waited >= READY_MIN) || waited >= READY_MAX {
+            bevy::log::info!(
+                "exile: combat ready after {:.1}s ({pending} models still loading)",
+                waited.as_secs_f32()
+            );
+            self.ready_sent = true;
+            let id = self.combat.clone();
+            self.send("combat.ready", json!({ "combatId": id }));
         }
     }
 
@@ -702,12 +848,20 @@ impl Bridge {
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
+                (self.ready_first, self.ready_quiet, self.ready_sent) = (None, None, false);
                 (self.flag_moved, self.flag_still, self.noflag_moved) = (0, 0, 0);
                 self.pending.clear();
                 self.focus = data["focusId"].as_str().map(str::to_owned);
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => {
+                // The start's frames show at once: the runtime holds after them until the
+                // models are up ([`Self::ready_check`]).
+                if !self.ready_sent {
+                    self.frame(data);
+                    self.ready_first.get_or_insert_with(Instant::now);
+                    return;
+                }
                 self.pending.push_back(data.clone());
                 while self.pending.len() > SEGMENT_FRAMES {
                     if let Some(f) = self.pending.pop_front() {
@@ -828,6 +982,7 @@ impl Bridge {
         let bytes0 = me.race as u32 | (me.class as u32) << 8 | (me.gender as u32) << 16;
         self.emit(unit_create(
             walk,
+            1.0,
             guid,
             EntityKind::Player,
             50,
@@ -880,6 +1035,14 @@ impl Bridge {
             if !self.shown.contains_key(id) && self.focus.as_deref() == Some(id) {
                 if let Some(me) = self.self_guid {
                     let from = self.ground.on_ground(BATTLE_CENTER);
+                    // The hero is the human female standard: her size is her scale.
+                    self.emit(SessionEvent::ObjectValues {
+                        guid: me,
+                        fields: ObjectFields::from_pairs(&[(
+                            FIELD_OBJECT_SCALE_X,
+                            actor_size(actor).to_bits(),
+                        )]),
+                    });
                     self.shown.insert(id.to_owned(), Shown {
                             guid: me,
                             pos: from,
@@ -887,6 +1050,7 @@ impl Bridge {
                             facing: 0.0,
                             walk_until: 0,
                             last_dqq: pos,
+                            enemy: false,
                         });
                 }
             }
@@ -999,12 +1163,18 @@ impl Bridge {
                 let player = actor["kind"].as_str() == Some("player");
                 let key = actor["model"].as_str().unwrap_or("Kobold").to_owned();
                 let display = self.models.resolve(&key);
+                let scale = self.models.unit_scale(
+                    display,
+                    actor_size(actor),
+                    actor["oversize"].as_bool() == Some(true),
+                );
                 let facing = target
                     .map(|t| (t[0] - pos[0], t[1] - pos[1]))
                     .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
                     .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
                 self.emit(unit_create(
                     COMBAT_WALK_SPEED,
+                    scale,
                     guid,
                     EntityKind::Unit,
                     display,
@@ -1022,16 +1192,26 @@ impl Bridge {
                 ));
                 self.shown.insert(
                     id.to_owned(),
-                    Shown { guid, pos, life, facing, walk_until: 0, last_dqq: pos },
+                    Shown {
+                        guid,
+                        pos,
+                        life,
+                        facing,
+                        walk_until: 0,
+                        last_dqq: pos,
+                        enemy: actor["kind"].as_str() == Some("enemy"),
+                    },
                 );
             }
         }
         let gone: Vec<String> = self.shown.keys().filter(|k| !seen.contains(k)).cloned().collect();
         for key in gone {
             if let Some(s) = self.shown.remove(&key) {
+                self.engaged.remove(&s.guid);
                 self.emit(SessionEvent::ObjectDestroyed(s.guid));
             }
         }
+        self.keep_engaged();
         for ev in data["events"].as_array().into_iter().flatten() {
             if ev["kind"].as_str() != Some("DamageTaken") || ev["success"].as_bool() != Some(true) {
                 continue;
@@ -1085,6 +1265,15 @@ fn replay_label(r: &Value) -> String {
     .replace([';', '|'], " ")
 }
 
+/// A DQQ actor's size: its radius over a standard one (`TileConst.TileRadius` 0.5, a character's
+/// and a common monster's), so the human female standard is 1, an elite 2, a boss 3.
+fn actor_size(actor: &Value) -> f32 {
+    (actor["radius"].as_f64().unwrap_or(STANDARD_RADIUS) / STANDARD_RADIUS).max(0.1) as f32
+}
+
+/// DQQ's standard actor radius (`TileConst.TileRadius`), size 1.
+const STANDARD_RADIUS: f64 = 0.5;
+
 /// The WoW facing (radians, 0 = +x north, counter-clockwise, in `[0, 2π)`) of a world-space
 /// step `(dx, dy)`.
 fn wow_facing(dx: f32, dy: f32) -> f32 {
@@ -1101,6 +1290,7 @@ fn angle_gap(a: f32, b: f32) -> f32 {
 /// ids and the given fields.
 fn unit_create(
     walk: f32,
+    scale: f32,
     guid: u64,
     kind: EntityKind,
     display: u32,
@@ -1114,6 +1304,7 @@ fn unit_create(
         (FIELD_OBJECT_TYPE, if player { 0x19 } else { 0x9 }),
         (FIELD_UNIT_DISPLAYID, display),
         (FIELD_UNIT_NATIVEDISPLAYID, display),
+        (FIELD_OBJECT_SCALE_X, scale.to_bits()),
     ];
     all.extend_from_slice(pairs);
     SessionEvent::ObjectCreate {
@@ -1122,7 +1313,7 @@ fn unit_create(
         display_id: Some(display),
         position,
         orientation,
-        scale: 1.0,
+        scale,
         speeds: Some(MoveSpeeds {
             walk,
             run: 7.0,
