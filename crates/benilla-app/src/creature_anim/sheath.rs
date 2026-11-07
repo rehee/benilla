@@ -199,7 +199,10 @@ pub(super) fn setter_refuses(
     classes: Option<&benilla_formats::ChrClasses>,
 ) -> bool {
     use benilla_protocol::messages::ObjectType;
+    // Exile deviation: DQQ, not the WoW class, decides what a hero wields, so a paladin-mapped
+    // hero with a bow draws it ranged (user 2026-11-07: bows in the left hand).
     state == 2
+        && !crate::net::exile_mode()
         && fields.is_some_and(|f| {
             f.object_type() == Some(ObjectType::Player)
                 && classes

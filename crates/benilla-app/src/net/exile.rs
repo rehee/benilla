@@ -21,7 +21,8 @@ use benilla_protocol::field::{
     FIELD_UNIT_MAXHEALTH,
 };
 use benilla_protocol::messages::{
-    AttackerState, Billing, ChatMessage, ItemInfo, ObjectType, ACCOUNT_DATA_SECTIONS, CHAT_MSG_PARTY,
+    AttackerState, Billing, ChatMessage, ItemInfo, ObjectType, SpellDamageLog, ACCOUNT_DATA_SECTIONS,
+    CHAT_MSG_PARTY,
     LANGUAGE_ADDON,
 };
 use benilla_protocol::{
@@ -44,6 +45,14 @@ const FIELD_OBJECT_SCALE_X: u16 = 4;
 const FIELD_UNIT_BYTES_0: u16 = 36;
 /// `UNIT_FIELD_BYTES_2` (164): byte 0 is the sheath state (0 sheathed, 1 melee drawn, 2 ranged).
 const FIELD_UNIT_BYTES_2: u16 = 164;
+/// A bow's attack: Auto Shot (`Spell.dbc` 75), launched with an arrow in flight.
+const AUTO_SHOT: u32 = 75;
+/// `SMSG_SPELL_GO`'s `CAST_FLAG_AMMO`: the missile carries [`ARROW_DISPLAY`].
+const CAST_FLAG_AMMO: u16 = 0x0020;
+/// `TARGET_FLAG_UNIT`: the cast names a unit target.
+const TARGET_FLAG_UNIT: u16 = 0x0002;
+/// `ItemDisplayInfo` 2414, `ArrowFlight_01` (a plain brown arrow).
+const ARROW_DISPLAY: u32 = 2414;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
 /// `PLAYER_BYTES` (193: skin, face, hair style, hair colour) and `PLAYER_BYTES_2` (194: facial
 /// hair), and `PLAYER_VISIBLE_ITEM_1_0` (260), each slot's item entry, 12 fields a slot.
@@ -471,6 +480,9 @@ struct Bridge {
     /// The WoW maps of the two (`Map.dbc` ids; user 2026-11-07: all of Azeroth).
     battle_map: u32,
     home_map: u32,
+    /// Units whose only weapon is ranged (a bow in the ranged slot): they fight with it drawn
+    /// (sheath state 2, the bow in the left hand), not a melee draw.
+    ranged: std::collections::HashSet<u64>,
     /// `.replay <scene>`: the next trip's battlefield scene, over the recording's own.
     scene_override: Option<String>,
     prepare_due: Option<Instant>,
@@ -527,6 +539,7 @@ impl Bridge {
             battle_map: MAP_ID,
             home_map: MAP_ID,
             scene_override: None,
+            ranged: std::collections::HashSet::new(),
             prepare_due: None,
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
@@ -815,6 +828,9 @@ impl Bridge {
         if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_LEVEL) {
             fields.push((FIELD_UNIT_LEVEL, 1));
         }
+        if Self::ranged_only(dress) {
+            self.ranged.insert(guid);
+        }
         self.player_names.insert(guid, name.clone());
         self.emit(SessionEvent::PlayerName { guid, name, race, gender, class: 1 });
         // A humanoid like the hero: its own scale times the size, without the footprint cap (a
@@ -825,6 +841,12 @@ impl Bridge {
         bevy::log::info!("exile: dressed {guid:#x} race {race} body {body} scale {scale} (capped {capped})");
         self.emit(unit_create(walk, scale, guid, EntityKind::Player, display, pos, facing, &fields));
         guid
+    }
+
+    /// Whether a `dress` holds a ranged weapon (slot 17) and nothing in the main hand (15).
+    fn ranged_only(dress: &Value) -> bool {
+        let slots: Vec<u64> = dress["items"].as_array().into_iter().flatten().filter_map(|i| i["slot"].as_u64()).collect();
+        slots.contains(&17) && !slots.contains(&15)
     }
 
     /// A `dress`'s look and gear as descriptor fields (`PLAYER_BYTES`, `PLAYER_BYTES_2`, each
@@ -1165,10 +1187,11 @@ impl Bridge {
             if let Some(victim) = nearest {
                 self.engaged.insert(guid, victim);
                 self.emit(SessionEvent::AttackStart { attacker: guid, victim });
-                // Weapons in hand while fighting (sheath state 1, `UNIT_FIELD_BYTES_2` byte 0).
+                // Weapons in hand while fighting (`UNIT_FIELD_BYTES_2` byte 0: 1 melee, 2 ranged).
+                let sheath = if self.ranged.contains(&guid) { 2 } else { 1 };
                 self.emit(SessionEvent::ObjectValues {
                     guid,
-                    fields: ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, 1)]),
+                    fields: ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, sheath)]),
                 });
             }
         }
@@ -1475,7 +1498,12 @@ impl Bridge {
                     // The seed's gear (user 2026-11-07: combat shows the recording's character),
                     // every held and worn slot set, so what the seed lacks comes off. Home again,
                     // `create_self` puts the roster's gear back.
+                    self.ranged.remove(&me);
                     if let Some(dress) = self.heroes.get(id).cloned() {
+                        if Self::ranged_only(&dress) {
+                            self.ranged.insert(me);
+                        }
+                        bevy::log::debug!("exile: hero {id} seed dress {dress}, ranged {}", self.ranged.contains(&me));
                         let worn = self.dress_fields(&dress);
                         for slot in 0..19u16 {
                             let field = FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot;
@@ -1675,12 +1703,46 @@ impl Bridge {
                 continue;
             };
             let crit = ev["critical"].as_bool() == Some(true);
+            let damage = ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32;
+            // A bow's hit is an Auto Shot (user 2026-11-07: bows drawn in the left hand): a
+            // melee swing would make the client draw melee (`0x62583a`) and put the bow away.
+            if self.ranged.contains(&attacker) {
+                self.emit(SessionEvent::SpellGo {
+                    caster: attacker,
+                    spell_id: AUTO_SHOT,
+                    cast_flags: CAST_FLAG_AMMO,
+                    hits: vec![victim],
+                    misses: Vec::new(),
+                    target: Some(victim),
+                    go_target: None,
+                    target_mask: TARGET_FLAG_UNIT,
+                    source: None,
+                    dest: None,
+                    ammo_display_id: Some(ARROW_DISPLAY),
+                    item_caster: None,
+                    unit_caster: attacker,
+                });
+                self.emit(SessionEvent::SpellDamageLog(SpellDamageLog {
+                    target: victim,
+                    attacker,
+                    spell_id: AUTO_SHOT,
+                    damage,
+                    school: 0,
+                    absorb: 0,
+                    resist: 0,
+                    periodic: false,
+                    blocked: 0,
+                    // SPELL_HIT_TYPE_CRIT.
+                    hit_info: if crit { 0x2 } else { 0 },
+                }));
+                continue;
+            }
             self.emit(SessionEvent::AttackerState(AttackerState {
                 attacker,
                 victim,
                 // HITINFO_AFFECTS_VICTIM, plus HITINFO_CRITICALHIT.
                 hit_info: 0x2 | if crit { 0x80 } else { 0 },
-                damage: ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32,
+                damage,
                 victim_state: 1,
                 absorb: 0,
                 resist: 0,
