@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use benilla_protocol::field::{
-    FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_FLAGS, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
+    FIELD_UNIT_CHANNEL_SPELL, FIELD_UNIT_DISPLAYID, FIELD_UNIT_FACTIONTEMPLATE, FIELD_UNIT_FLAGS, FIELD_UNIT_HEALTH, FIELD_UNIT_LEVEL,
     FIELD_UNIT_MAXHEALTH,
 };
 use benilla_protocol::messages::{
@@ -63,6 +63,8 @@ const MARKER_FLAGS: u32 = 0x0200_0000 | 0x2;
 const PROJECTILE_HEIGHT: f32 = 1.2;
 /// A finished projectile's markers stay this long, for the missile to land.
 const PROJECTILE_LINGER: Duration = Duration::from_millis(800);
+/// `UNIT_FIELD_CHANNEL_OBJECT` (a guid, two words from field 20); the protocol keeps its name private.
+const FIELD_UNIT_CHANNEL_OBJECT_LO: u16 = 20;
 /// How long a ray's markers stand: a channel beam (Mind Flay) shows until its caster goes.
 const RAY_LIFE: Duration = Duration::from_millis(900);
 /// How long after an area marker is created its effect is cast (its model built first).
@@ -511,6 +513,8 @@ struct Bridge {
     markers: Vec<(u64, Instant)>,
     /// Casts waiting for their marker's model ([`MARKER_EMBODY`]): (caster, target, spell, when).
     marker_casts: Vec<(u64, u64, u32, Instant)>,
+    /// Channels waiting for their marker's model: (channeller, channel object, spell, when).
+    marker_channels: Vec<(u64, u64, u32, Instant)>,
     next_marker: u64,
     /// DQQ projectiles in flight (PLAN-0006 D): id → (launch marker, flying marker, position).
     projectiles: HashMap<String, (u64, u64, [f32; 3])>,
@@ -569,6 +573,7 @@ impl Bridge {
             next_dressed: 0x0010_0000,
             markers: Vec::new(),
             marker_casts: Vec::new(),
+            marker_channels: Vec::new(),
             next_marker: 0,
             projectiles: HashMap::new(),
             ready_quiet: None,
@@ -1171,6 +1176,18 @@ impl Bridge {
         self.marker_casts = waiting;
         for (caster, target, spell, _) in due {
             self.cast_go(caster, target, spell, "marker");
+        }
+        let (due, waiting): (Vec<_>, Vec<_>) = self.marker_channels.drain(..).partition(|c| now >= c.3);
+        self.marker_channels = waiting;
+        for (caster, object, spell, _) in due {
+            self.emit(SessionEvent::ObjectValues {
+                guid: caster,
+                fields: ObjectFields::from_pairs(&[
+                    (FIELD_UNIT_CHANNEL_OBJECT_LO, object as u32),
+                    (FIELD_UNIT_CHANNEL_OBJECT_LO + 1, (object >> 32) as u32),
+                    (FIELD_UNIT_CHANNEL_SPELL, spell),
+                ]),
+            });
         }
         let (gone, kept): (Vec<_>, Vec<_>) = self.markers.drain(..).partition(|m| now >= m.1);
         self.markers = kept;
@@ -1840,7 +1857,14 @@ impl Bridge {
                     [0, 1, 2].map(|i| c[i].as_f64().unwrap_or(1.0) as f32)
                 });
                 super::set_beam_tint(a, tint);
-                self.marker_casts.push((a, b, spell, Instant::now() + MARKER_EMBODY));
+                if ev["channel"].as_bool() == Some(true) {
+                    // A channel beam (Mind Flay): the start marker channels the spell at the end
+                    // one (`UNIT_FIELD_CHANNEL_OBJECT` + `UNIT_CHANNEL_SPELL`); the channel poll
+                    // plays its kit and draws the beam, which lasts until the marker goes.
+                    self.marker_channels.push((a, b, spell, Instant::now() + MARKER_EMBODY));
+                } else {
+                    self.marker_casts.push((a, b, spell, Instant::now() + MARKER_EMBODY));
+                }
                 // A channel's beam lasts while its caster stands: the ray's markers go soon.
                 let gone = Instant::now() + RAY_LIFE;
                 self.markers.push((a, gone));
