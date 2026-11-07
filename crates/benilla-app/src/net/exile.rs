@@ -21,7 +21,7 @@ use benilla_protocol::field::{
     FIELD_UNIT_MAXHEALTH,
 };
 use benilla_protocol::messages::{
-    AttackerState, Billing, ChatMessage, ItemInfo, ObjectType, SpellDamageLog, ACCOUNT_DATA_SECTIONS,
+    AttackerState, Billing, ChatMessage, ItemInfo, ObjectType, SpellDamageLog, SpellHealLog, ACCOUNT_DATA_SECTIONS,
     CHAT_MSG_PARTY,
     LANGUAGE_ADDON,
 };
@@ -45,14 +45,14 @@ const FIELD_OBJECT_SCALE_X: u16 = 4;
 const FIELD_UNIT_BYTES_0: u16 = 36;
 /// `UNIT_FIELD_BYTES_2` (164): byte 0 is the sheath state (0 sheathed, 1 melee drawn, 2 ranged).
 const FIELD_UNIT_BYTES_2: u16 = 164;
-/// A bow's attack: Auto Shot (`Spell.dbc` 75), launched with an arrow in flight.
-const AUTO_SHOT: u32 = 75;
 /// `SMSG_SPELL_GO`'s `CAST_FLAG_AMMO`: the missile carries [`ARROW_DISPLAY`].
 const CAST_FLAG_AMMO: u16 = 0x0020;
 /// `TARGET_FLAG_UNIT`: the cast names a unit target.
 const TARGET_FLAG_UNIT: u16 = 0x0002;
-/// `ItemDisplayInfo` 2414, `ArrowFlight_01` (a plain brown arrow).
+/// `ItemDisplayInfo` 2414, `ArrowFlight_01` (a plain brown arrow): a shot's missile.
 const ARROW_DISPLAY: u32 = 2414;
+/// A thrown javelin's missile: the javelin's own look (`config/mapping/equipment.json` Javelin).
+const JAVELIN_DISPLAY: u32 = 1733;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
 /// `PLAYER_BYTES` (193: skin, face, hair style, hair colour) and `PLAYER_BYTES_2` (194: facial
 /// hair), and `PLAYER_VISIBLE_ITEM_1_0` (260), each slot's item entry, 12 fields a slot.
@@ -624,6 +624,18 @@ impl Bridge {
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
                 let scene = text.trim_start().trim_start_matches(".replay").trim();
                 self.scene_override = (!scene.is_empty()).then(|| scene.to_owned());
+                self.start_replay();
+            }
+            // `.play <name> [scene]`: the recording `replays/replay-<name>.txt` (or a file name), for
+            // reviewing one skill's presentation (PLAN-0006 D).
+            ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".play") => {
+                let mut args = text.trim_start().trim_start_matches(".play").split_whitespace();
+                let Some(name) = args.next() else { return };
+                let file = if name.ends_with(".txt") { name.to_owned() } else { format!("replay-{name}.txt") };
+                bevy::log::info!("exile: .play {file}");
+                self.replay_id = None;
+                self.replay_file = Some(file);
+                self.scene_override = args.next().map(str::to_owned);
                 self.start_replay();
             }
             // `.goto <x> <y>`: scout a battlefield (PLAN-0006 E).
@@ -1695,62 +1707,113 @@ impl Bridge {
         }
         self.keep_engaged();
         for ev in data["events"].as_array().into_iter().flatten() {
-            if ev["kind"].as_str() != Some("DamageTaken") || ev["success"].as_bool() != Some(true) {
-                continue;
+            self.play_event(ev);
+        }
+    }
+
+    /// One DQQ event as WoW plays it (PLAN-0006 D, `docs/skill-presentation.md`). The runtime has
+    /// resolved the action and the WoW spell to borrow (`config/mapping/skills.json`): a cast or a
+    /// launch plays the spell (`SMSG_SPELL_GO`: its cast animation, missile and impact kits); a
+    /// melee action's damage is a swing (`AttackerState`); any other damage or heal is a spell log,
+    /// whose number takes the school's colour; a duration that appears plays its spell on the unit.
+    fn play_event(&mut self, ev: &Value) {
+        if ev["success"].as_bool() == Some(false) {
+            return;
+        }
+        let guid_of = |k: &str| ev[k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
+        let action = ev["action"].as_str().unwrap_or("none");
+        let spell = ev["spell"].as_u64().unwrap_or(0) as u32;
+        let school = ev["school"].as_u64().unwrap_or(0) as u8;
+        let crit = ev["critical"].as_bool() == Some(true);
+        let amount = ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32;
+        match ev["kind"].as_str().unwrap_or("") {
+            // The cast (Cast / Launch phase): the spell's cast animation, self kit and missile.
+            "CastSkill" | "ActiveAura" => {
+                let Some(caster) = guid_of("from") else { return };
+                if spell == 0 || matches!(action, "melee" | "mobAttack" | "none") {
+                    return;
+                }
+                let target = guid_of("target").unwrap_or(caster);
+                self.cast_go(caster, target, spell, action);
             }
-            let guid_of = |k: &str| ev[k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
-            let (Some(attacker), Some(victim)) = (guid_of("from"), guid_of("target")) else {
-                continue;
-            };
-            let crit = ev["critical"].as_bool() == Some(true);
-            let damage = ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32;
-            // A bow's hit is an Auto Shot (user 2026-11-07: bows drawn in the left hand): a
-            // melee swing would make the client draw melee (`0x62583a`) and put the bow away.
-            if self.ranged.contains(&attacker) {
-                self.emit(SessionEvent::SpellGo {
-                    caster: attacker,
-                    spell_id: AUTO_SHOT,
-                    cast_flags: CAST_FLAG_AMMO,
-                    hits: vec![victim],
-                    misses: Vec::new(),
-                    target: Some(victim),
-                    go_target: None,
-                    target_mask: TARGET_FLAG_UNIT,
-                    source: None,
-                    dest: None,
-                    ammo_display_id: Some(ARROW_DISPLAY),
-                    item_caster: None,
-                    unit_caster: attacker,
-                });
+            // A duration appeared: its start spell on the unit wearing it (warcry, the beam
+            // cannon's charge-up and dash, …), cast by and on that unit.
+            "DurationStart" => {
+                if let (Some(unit), true) = (guid_of("target"), spell != 0) {
+                    self.cast_go(unit, unit, spell, action);
+                }
+            }
+            "DamageTaken" => {
+                let Some(victim) = guid_of("target") else { return };
+                let attacker = guid_of("from").unwrap_or(victim);
+                if matches!(action, "melee" | "mobAttack") && attacker != victim {
+                    self.emit(SessionEvent::AttackerState(AttackerState {
+                        attacker,
+                        victim,
+                        // HITINFO_AFFECTS_VICTIM, plus HITINFO_CRITICALHIT.
+                        hit_info: 0x2 | if crit { 0x80 } else { 0 },
+                        damage: amount,
+                        victim_state: 1,
+                        absorb: 0,
+                        resist: 0,
+                        blocked: 0,
+                        melee_spell_id: 0,
+                        school: u32::from(school),
+                    }));
+                    return;
+                }
                 self.emit(SessionEvent::SpellDamageLog(SpellDamageLog {
                     target: victim,
                     attacker,
-                    spell_id: AUTO_SHOT,
-                    damage,
-                    school: 0,
+                    spell_id: spell,
+                    damage: amount,
+                    school,
                     absorb: 0,
                     resist: 0,
-                    periodic: false,
+                    // A duration's tick (no skill): the periodic number.
+                    periodic: action == "none",
                     blocked: 0,
                     // SPELL_HIT_TYPE_CRIT.
                     hit_info: if crit { 0x2 } else { 0 },
                 }));
-                continue;
             }
-            self.emit(SessionEvent::AttackerState(AttackerState {
-                attacker,
-                victim,
-                // HITINFO_AFFECTS_VICTIM, plus HITINFO_CRITICALHIT.
-                hit_info: 0x2 | if crit { 0x80 } else { 0 },
-                damage,
-                victim_state: 1,
-                absorb: 0,
-                resist: 0,
-                blocked: 0,
-                melee_spell_id: 0,
-                school: 0,
-            }));
+            "HealingTaken" => {
+                let Some(target) = guid_of("target") else { return };
+                self.emit(SessionEvent::SpellHealLog(SpellHealLog {
+                    target,
+                    healer: guid_of("from").unwrap_or(target),
+                    spell_id: spell,
+                    amount,
+                    critical: crit,
+                }));
+            }
+            _ => {}
         }
+    }
+
+    /// `SMSG_SPELL_GO` for a borrowed spell, unit to unit: a shot or a throw carries its ammo
+    /// (an arrow, or the javelin itself) so the missile flies.
+    fn cast_go(&mut self, caster: u64, target: u64, spell: u32, action: &str) {
+        let ammo = match action {
+            "shoot" => Some(ARROW_DISPLAY),
+            "throw" => Some(JAVELIN_DISPLAY),
+            _ => None,
+        };
+        self.emit(SessionEvent::SpellGo {
+            caster,
+            spell_id: spell,
+            cast_flags: if ammo.is_some() { CAST_FLAG_AMMO } else { 0 },
+            hits: vec![target],
+            misses: Vec::new(),
+            target: Some(target),
+            go_target: None,
+            target_mask: TARGET_FLAG_UNIT,
+            source: None,
+            dest: None,
+            ammo_display_id: ammo,
+            item_caster: None,
+            unit_caster: caster,
+        });
     }
 }
 
