@@ -42,6 +42,8 @@ const FIELD_OBJECT_ENTRY: u16 = 3;
 /// `OBJECT_FIELD_SCALE_X` (4), the complete render scale, a float.
 const FIELD_OBJECT_SCALE_X: u16 = 4;
 const FIELD_UNIT_BYTES_0: u16 = 36;
+/// `UNIT_FIELD_BYTES_2` (164): byte 0 is the sheath state (0 sheathed, 1 melee drawn, 2 ranged).
+const FIELD_UNIT_BYTES_2: u16 = 164;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
 /// `PLAYER_BYTES` (193: skin, face, hair style, hair colour) and `PLAYER_BYTES_2` (194: facial
 /// hair), and `PLAYER_VISIBLE_ITEM_1_0` (260), each slot's item entry, 12 fields a slot.
@@ -447,6 +449,8 @@ struct Bridge {
     /// gear points at (`ItemQuery`), and the next guid (a player's high guid, 0, so names resolve
     /// as a player's).
     player_names: HashMap<u64, String>,
+    /// Each roster entry's hero `dress` (look and gear), worn by the player's own unit.
+    hero_dress: HashMap<u64, Value>,
     dress_items: HashMap<u32, (u32, u32, u32, u32)>,
     next_dressed: u64,
 }
@@ -491,6 +495,7 @@ impl Bridge {
             lineup_only: Vec::new(),
             creature_names: HashMap::new(),
             player_names: HashMap::new(),
+            hero_dress: HashMap::new(),
             dress_items: HashMap::new(),
             next_dressed: 0x0010_0000,
             ready_quiet: None,
@@ -583,6 +588,7 @@ impl Bridge {
             }
             // A unit's name: the entries this bridge filed (`creature_names`); any other unknown.
             ClientCommand::ItemQuery { entry, .. } => {
+                bevy::log::info!("exile: item query {entry} known {}", self.dress_items.contains_key(entry));
                 let info = self.dress_items.get(entry).map(|&(d, inv, c, sc)| Box::new(item_info(d, inv, c, sc)));
                 self.emit(SessionEvent::ItemTemplate { entry: *entry, info });
             }
@@ -756,8 +762,35 @@ impl Bridge {
         let display = native_display(race, gender);
         let guid = self.next_dressed;
         self.next_dressed += 1;
+        let mut fields = vec![(FIELD_UNIT_BYTES_0, race | 1 << 8 | gender << 16 | 1 << 24)];
+        fields.extend(self.dress_fields(dress));
+        fields.extend_from_slice(pairs);
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_HEALTH) {
+            fields.extend_from_slice(&[(FIELD_UNIT_HEALTH, 100), (FIELD_UNIT_MAXHEALTH, 100)]);
+        }
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_FACTIONTEMPLATE) {
+            fields.push((FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE));
+        }
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_LEVEL) {
+            fields.push((FIELD_UNIT_LEVEL, 1));
+        }
+        self.player_names.insert(guid, name.clone());
+        self.emit(SessionEvent::PlayerName { guid, name, race, gender, class: 1 });
+        // A humanoid like the hero: its own scale times the size, without the footprint cap (a
+        // character model's bounds take in its whole animation range and would shrink it).
+        let capped = self.models.unit_scale(display, size, false);
+        let scale = self.models.unit_scale(display, size, true);
+        let body = display;
+        bevy::log::info!("exile: dressed {guid:#x} race {race} body {body} scale {scale} (capped {capped})");
+        self.emit(unit_create(walk, scale, guid, EntityKind::Player, display, pos, facing, &fields));
+        guid
+    }
+
+    /// A `dress`'s look and gear as descriptor fields (`PLAYER_BYTES`, `PLAYER_BYTES_2`, each
+    /// slot's `PLAYER_VISIBLE_ITEM_n_0`), its item templates sent ahead the first time each is seen.
+    fn dress_fields(&mut self, dress: &Value) -> Vec<(u16, u32)> {
+        let n = |k: &str| u32::try_from(dress[k].as_u64().unwrap_or(0)).unwrap_or(0);
         let mut fields = vec![
-            (FIELD_UNIT_BYTES_0, race | 1 << 8 | gender << 16 | 1 << 24),
             (
                 FIELD_PLAYER_BYTES,
                 n("skin") | n("face") << 8 | n("hair") << 16 | n("hairColor") << 24,
@@ -780,26 +813,7 @@ impl Bridge {
             }
             fields.push((FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot as u16, entry));
         }
-        fields.extend_from_slice(pairs);
-        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_HEALTH) {
-            fields.extend_from_slice(&[(FIELD_UNIT_HEALTH, 100), (FIELD_UNIT_MAXHEALTH, 100)]);
-        }
-        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_FACTIONTEMPLATE) {
-            fields.push((FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE));
-        }
-        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_LEVEL) {
-            fields.push((FIELD_UNIT_LEVEL, 1));
-        }
-        self.player_names.insert(guid, name.clone());
-        self.emit(SessionEvent::PlayerName { guid, name, race, gender, class: 1 });
-        // A humanoid like the hero: its own scale times the size, without the footprint cap (a
-        // character model's bounds take in its whole animation range and would shrink it).
-        let capped = self.models.unit_scale(display, size, false);
-        let scale = self.models.unit_scale(display, size, true);
-        let body = display;
-        bevy::log::info!("exile: dressed {guid:#x} race {race} body {body} scale {scale} (capped {capped})");
-        self.emit(unit_create(walk, scale, guid, EntityKind::Player, display, pos, facing, &fields));
-        guid
+        fields
     }
 
     /// `SMSG_NAME_QUERY_RESPONSE`'s stand-in: our own name, an empty one for anyone else.
@@ -984,6 +998,11 @@ impl Bridge {
             if let Some(victim) = nearest {
                 self.engaged.insert(guid, victim);
                 self.emit(SessionEvent::AttackStart { attacker: guid, victim });
+                // Weapons in hand while fighting (sheath state 1, `UNIT_FIELD_BYTES_2` byte 0).
+                self.emit(SessionEvent::ObjectValues {
+                    guid,
+                    fields: ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, 1)]),
+                });
             }
         }
     }
@@ -1117,19 +1136,37 @@ impl Bridge {
     fn roster_from(&mut self, list: &Value) {
         self.roster.clear();
         self.dqq_ids.clear();
+        self.hero_dress.clear();
         for (i, c) in list.as_array().into_iter().flatten().enumerate() {
             let guid = i as u64 + 1;
             self.dqq_ids.insert(guid, c["id"].as_str().unwrap_or_default().to_owned());
+            // The hero's look and gear (runtime `equipment.json`): the select screen's model, and
+            // the player's own unit in the world.
+            let dress = c["dress"].clone();
+            let look = |k: &str| u8::try_from(dress[k].as_u64().unwrap_or(0)).unwrap_or(0);
+            let mut equipment = [CharEnumItem::default(); 19];
+            for item in dress["items"].as_array().into_iter().flatten() {
+                let slot = item["slot"].as_u64().unwrap_or(99) as usize;
+                if let Some(e) = equipment.get_mut(slot) {
+                    e.display_id = u32::try_from(item["displayId"].as_u64().unwrap_or(0)).unwrap_or(0);
+                    e.inventory_type = u8::try_from(item["inventoryType"].as_u64().unwrap_or(0)).unwrap_or(0);
+                }
+            }
+            let (skin, face, hair_style, hair_color) =
+                (look("skin"), look("face"), look("hair"), look("hairColor"));
+            if dress.is_object() {
+                self.hero_dress.insert(guid, dress.clone());
+            }
             self.roster.push(Character {
                 guid,
                 name: c["name"].as_str().unwrap_or("Exile").chars().take(12).collect(),
                 race: c["wowRace"].as_u64().unwrap_or(1) as u8,
                 class: c["wowClass"].as_u64().unwrap_or(1) as u8,
                 gender: c["wowGender"].as_u64().unwrap_or(1) as u8,
-                skin: 0,
-                face: 0,
-                hair_style: 0,
-                hair_color: 0,
+                skin,
+                face,
+                hair_style,
+                hair_color,
                 facial_hair: 0,
                 level: c["level"].as_u64().unwrap_or(1).clamp(1, 60) as u8,
                 new_character: false,
@@ -1142,7 +1179,7 @@ impl Bridge {
                 },
                 guild_id: 0,
                 flags: 0,
-                equipment: [CharEnumItem::default(); 19],
+                equipment,
                 pet_display_id: 0,
                 pet_level: 0,
                 pet_family: 0,
@@ -1195,21 +1232,31 @@ impl Bridge {
     fn create_self(&mut self, pos: [f32; 3], walk: f32) {
         let (Some(guid), Some(me)) = (self.self_guid, self.me.clone()) else { return };
         let bytes0 = me.race as u32 | (me.class as u32) << 8 | (me.gender as u32) << 16;
+        let mut fields = vec![
+            (FIELD_UNIT_HEALTH, 100),
+            (FIELD_UNIT_MAXHEALTH, 100),
+            (FIELD_UNIT_LEVEL, me.level as u32),
+            (FIELD_UNIT_FACTIONTEMPLATE, FACTION_PLAYER),
+            (FIELD_UNIT_BYTES_0, bytes0),
+        ];
+        // The hero's look and gear (`equipment.json`, through the roster).
+        if let Some(dress) = self.hero_dress.get(&me.guid).cloned() {
+            fields.extend(self.dress_fields(&dress));
+        }
+        bevy::log::info!(
+            "exile: own unit for roster {} wears {} item(s)",
+            me.guid,
+            self.hero_dress.get(&me.guid).map_or(0, |d| d["items"].as_array().map_or(0, Vec::len))
+        );
         self.emit(unit_create(
             walk,
             1.0,
             guid,
             EntityKind::Player,
-            50,
+            native_display(u32::from(me.race), u32::from(me.gender)),
             pos,
             0.0,
-            &[
-                (FIELD_UNIT_HEALTH, 100),
-                (FIELD_UNIT_MAXHEALTH, 100),
-                (FIELD_UNIT_LEVEL, me.level as u32),
-                (FIELD_UNIT_FACTIONTEMPLATE, FACTION_PLAYER),
-                (FIELD_UNIT_BYTES_0, bytes0),
-            ],
+            &fields,
         ));
     }
 
