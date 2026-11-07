@@ -21,7 +21,7 @@ use benilla_protocol::field::{
     FIELD_UNIT_MAXHEALTH,
 };
 use benilla_protocol::messages::{
-    AttackerState, Billing, ChatMessage, ObjectType, ACCOUNT_DATA_SECTIONS, CHAT_MSG_PARTY,
+    AttackerState, Billing, ChatMessage, ItemInfo, ObjectType, ACCOUNT_DATA_SECTIONS, CHAT_MSG_PARTY,
     LANGUAGE_ADDON,
 };
 use benilla_protocol::{
@@ -37,10 +37,20 @@ use super::{CharRequest, ClientCommand, LoginRequest, ParkRequest, ParkSender, R
 /// `OBJECT_FIELD_TYPE` (2), `UNIT_FIELD_BYTES_0` (36: race, class, gender, power type) and
 /// `UNIT_FIELD_NATIVEDISPLAYID` (132), 1.12.1 indices.
 const FIELD_OBJECT_TYPE: u16 = 2;
+/// `OBJECT_FIELD_ENTRY` (3): a unit's creature template, which its name query asks by.
+const FIELD_OBJECT_ENTRY: u16 = 3;
 /// `OBJECT_FIELD_SCALE_X` (4), the complete render scale, a float.
 const FIELD_OBJECT_SCALE_X: u16 = 4;
 const FIELD_UNIT_BYTES_0: u16 = 36;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
+/// `PLAYER_BYTES` (193: skin, face, hair style, hair colour) and `PLAYER_BYTES_2` (194: facial
+/// hair), and `PLAYER_VISIBLE_ITEM_1_0` (260), each slot's item entry, 12 fields a slot.
+const FIELD_PLAYER_BYTES: u16 = 193;
+const FIELD_PLAYER_BYTES_2: u16 = 194;
+const FIELD_PLAYER_VISIBLE_ITEM_1_0: u16 = 260;
+const VISIBLE_ITEM_STRIDE: u16 = 12;
+/// A dressed unit's item templates: entry = this + the item's `ItemDisplayInfo` id.
+const DRESS_ITEM_BASE: u32 = 800_000;
 /// Human faction template (friendly to the player) and a hostile one for enemies.
 const FACTION_PLAYER: u32 = 1;
 const FACTION_HOSTILE: u32 = 14;
@@ -55,6 +65,11 @@ const ORIGIN: [f32; 3] = [-8949.95, -132.49, 83.6];
 const BATTLE_CENTER: [f32; 3] = [-8934.95, -117.49, 83.6];
 const DQQ_FIELD_HALF: f64 = 5.0;
 const YARDS_PER_UNIT: f32 = 2.0;
+/// `.lineup`: models per row, and yards between them at size 1.
+const LINEUP_ROW: usize = 6;
+const LINEUP_GAP: f32 = 3.5;
+/// The lineup's creature entries (names) start here, clear of any real template.
+const LINEUP_ENTRY: u32 = 900_000;
 
 
 /// Units and players whose model has not built yet ([`count_unembodied`]): a combat's start
@@ -421,6 +436,19 @@ struct Bridge {
     flag_moved: u64,
     flag_still: u64,
     noflag_moved: u64,
+    /// The player's last reported spot and facing (free mode), and the lineup's units.
+    me_at: Option<([f32; 3], f32)>,
+    lineup: Vec<u64>,
+    /// `.lineup mobs <name…>`'s names (lower case); empty for all.
+    lineup_only: Vec<String>,
+    /// Creature template entry → name, answered to `CreatureQuery`.
+    creature_names: HashMap<u32, String>,
+    /// Dressed units ([`Self::dress_create`]): their names (`NameQuery`), the item templates their
+    /// gear points at (`ItemQuery`), and the next guid (a player's high guid, 0, so names resolve
+    /// as a player's).
+    player_names: HashMap<u64, String>,
+    dress_items: HashMap<u32, (u32, u32, u32, u32)>,
+    next_dressed: u64,
 }
 
 impl Bridge {
@@ -458,6 +486,13 @@ impl Bridge {
             replay_id: None,
             engaged: HashMap::new(),
             ready_first: None,
+            me_at: None,
+            lineup: Vec::new(),
+            lineup_only: Vec::new(),
+            creature_names: HashMap::new(),
+            player_names: HashMap::new(),
+            dress_items: HashMap::new(),
+            next_dressed: 0x0010_0000,
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -537,6 +572,24 @@ impl Bridge {
             ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".replay") => {
                 self.start_replay();
             }
+            // `.lineup <display>…`: a review row of models (PLAN-0006).
+            ClientCommand::Chat { text, .. } if text.trim_start().starts_with(".lineup") => {
+                let args = text.trim_start().trim_start_matches(".lineup").to_owned();
+                self.lineup(&args);
+            }
+            // Where the player stands, for the lineup.
+            ClientCommand::Move { pos, orientation, .. } => {
+                self.me_at = Some((*pos, *orientation));
+            }
+            // A unit's name: the entries this bridge filed (`creature_names`); any other unknown.
+            ClientCommand::ItemQuery { entry, .. } => {
+                let info = self.dress_items.get(entry).map(|&(d, inv, c, sc)| Box::new(item_info(d, inv, c, sc)));
+                self.emit(SessionEvent::ItemTemplate { entry: *entry, info });
+            }
+            ClientCommand::CreatureQuery { entry, .. } => {
+                let name = self.creature_names.get(entry).cloned();
+                self.emit(creature_name(*entry, name));
+            }
             // Names: the player's own (addon lines name it as their sender); any other is unknown.
             ClientCommand::NameQuery { guid } => self.answer_name(*guid),
             // The Exile UI addon's requests (`docs/bridge-protocol.md` §4).
@@ -580,8 +633,181 @@ impl Bridge {
         }
     }
 
+    /// `.lineup [size=<n>] <display>…` in free mode: the given creature displays in rows of
+    /// [`LINEUP_ROW`] before the player, each named `#<display>` and drawn at combat scale for a DQQ
+    /// size `n` (default 1). `.lineup mobs [name…]` shows the runtime's monster table instead
+    /// (only the named ones, when any are named)
+    /// (`ui.mapping.mobs`), each under its DQQ name. A bare `.lineup` clears the row. A review aid
+    /// for the DQQ → WoW tables (PLAN-0006).
+    fn lineup(&mut self, args: &str) {
+        let mut words = args.split_whitespace();
+        if words.clone().next() == Some("mobs") {
+            // `.lineup mobs [name…]`: only the named monsters, when any are named.
+            self.lineup_only = words.skip(1).map(str::to_ascii_lowercase).collect();
+            self.send("ui.mapping.mobs", Value::Null);
+            return;
+        }
+        let mut size = 1.0_f32;
+        let mut shown = Vec::new();
+        for word in args.split(|c: char| c.is_whitespace() || c == ',') {
+            if let Some(n) = word.strip_prefix("size=").and_then(|n| n.parse().ok()) {
+                size = n;
+            } else if let Ok(id) = word.parse::<u32>() {
+                shown.push((id, format!("#{id}"), size, None));
+            }
+        }
+        self.lineup_show(shown);
+    }
+
+    /// `ui.mapping.mobs.result`: every monster's look, a boss at a boss's size (radius 1.5).
+    fn lineup_mobs(&mut self, data: &Value) {
+        let shown = data
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| {
+                let name = m["mob"].as_str().unwrap_or_default().to_ascii_lowercase();
+                self.lineup_only.is_empty() || self.lineup_only.contains(&name)
+            })
+            .filter_map(|m| {
+                let display = u32::try_from(m["displayId"].as_u64()?).ok()?;
+                let size = if m["boss"].as_bool() == Some(true) { 3.0 } else { 1.0 };
+                let dress = Some(m["dress"].clone()).filter(Value::is_object);
+                Some((display, m["mob"].as_str()?.to_owned(), size, dress))
+            })
+            .collect();
+        self.lineup_show(shown);
+    }
+
+    /// The lineup itself: `(display, name, size, dress)` in rows facing the player.
+    fn lineup_show(&mut self, shown: Vec<(u32, String, f32, Option<Value>)>) {
+        for guid in std::mem::take(&mut self.lineup) {
+            self.emit(SessionEvent::ObjectDestroyed(guid));
+        }
+        if self.phase != Phase::Free {
+            return;
+        }
+        let (at, o) = self.me_at.unwrap_or((ORIGIN, 0.0));
+        let (fx, fy) = (o.cos(), o.sin());
+        let (rx, ry) = (fy, -fx);
+        let widest = shown.iter().map(|s| s.2).fold(1.0_f32, f32::max);
+        let gap = LINEUP_GAP * widest.min(2.0);
+        for (i, (display, name, size, dress)) in shown.into_iter().enumerate() {
+            let (row, col) = ((i / LINEUP_ROW) as f32, (i % LINEUP_ROW) as f32);
+            let ahead = 6.0 + row * gap;
+            let side = (col - (LINEUP_ROW as f32 - 1.0) / 2.0) * gap;
+            let pos = self.ground.on_ground([
+                at[0] + fx * ahead + rx * side,
+                at[1] + fy * ahead + ry * side,
+                at[2],
+            ]);
+            let facing = (o + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+            if let Some(dress) = dress {
+                let guid = self.dress_create(&dress, name, size, pos, facing, FREE_WALK_SPEED, &[]);
+                self.lineup.push(guid);
+                continue;
+            }
+            let guid = self.next_creature;
+            self.next_creature += 1;
+            // Its own entry, so each name stands alone; the name goes ahead of the unit, whose
+            // create reads the cache.
+            let entry = LINEUP_ENTRY + i as u32;
+            self.creature_names.insert(entry, name.clone());
+            self.emit(creature_name(entry, Some(name)));
+            let scale = self.models.unit_scale(display, size, false);
+            self.emit(unit_create(
+                FREE_WALK_SPEED,
+                scale,
+                guid,
+                EntityKind::Unit,
+                display,
+                pos,
+                facing,
+                &[
+                    (FIELD_OBJECT_ENTRY, entry),
+                    (FIELD_UNIT_HEALTH, 100),
+                    (FIELD_UNIT_MAXHEALTH, 100),
+                    (FIELD_UNIT_LEVEL, 1),
+                    (FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE),
+                ],
+            ));
+            self.lineup.push(guid);
+        }
+        bevy::log::info!("exile: lineup of {}", self.lineup.len());
+    }
+
+    /// A dressed humanoid (an actor's or a lineup entry's `dress`, runtime `Dress`): a player-style
+    /// unit of the given race and sex, its look bytes, and its gear as visible items whose
+    /// templates (`ItemTemplate`, display id and slot family) and name (`PlayerName`) go ahead of
+    /// it. Drawn at combat scale for DQQ `size`; `pairs` are its other fields. The guid made.
+    #[allow(clippy::too_many_arguments)]
+    fn dress_create(
+        &mut self,
+        dress: &Value,
+        name: String,
+        size: f32,
+        pos: [f32; 3],
+        facing: f32,
+        walk: f32,
+        pairs: &[(u16, u32)],
+    ) -> u64 {
+        let n = |k: &str| u32::try_from(dress[k].as_u64().unwrap_or(0)).unwrap_or(0);
+        let (race, gender) = (n("race").max(1), n("gender").min(1));
+        let display = native_display(race, gender);
+        let guid = self.next_dressed;
+        self.next_dressed += 1;
+        let mut fields = vec![
+            (FIELD_UNIT_BYTES_0, race | 1 << 8 | gender << 16 | 1 << 24),
+            (
+                FIELD_PLAYER_BYTES,
+                n("skin") | n("face") << 8 | n("hair") << 16 | n("hairColor") << 24,
+            ),
+            (FIELD_PLAYER_BYTES_2, 0),
+        ];
+        for item in dress["items"].as_array().into_iter().flatten() {
+            let m = |k: &str| u32::try_from(item[k].as_u64().unwrap_or(0)).unwrap_or(0);
+            let (slot, shown) = (m("slot"), m("displayId"));
+            if slot > 18 || shown == 0 {
+                continue;
+            }
+            let entry = DRESS_ITEM_BASE + shown;
+            let template = (shown, m("inventoryType"), m("itemClass"), m("itemSubclass"));
+            if self.dress_items.insert(entry, template) != Some(template) {
+                self.emit(SessionEvent::ItemTemplate {
+                    entry,
+                    info: Some(Box::new(item_info(template.0, template.1, template.2, template.3))),
+                });
+            }
+            fields.push((FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot as u16, entry));
+        }
+        fields.extend_from_slice(pairs);
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_HEALTH) {
+            fields.extend_from_slice(&[(FIELD_UNIT_HEALTH, 100), (FIELD_UNIT_MAXHEALTH, 100)]);
+        }
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_FACTIONTEMPLATE) {
+            fields.push((FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE));
+        }
+        if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_LEVEL) {
+            fields.push((FIELD_UNIT_LEVEL, 1));
+        }
+        self.player_names.insert(guid, name.clone());
+        self.emit(SessionEvent::PlayerName { guid, name, race, gender, class: 1 });
+        // A humanoid like the hero: its own scale times the size, without the footprint cap (a
+        // character model's bounds take in its whole animation range and would shrink it).
+        let capped = self.models.unit_scale(display, size, false);
+        let scale = self.models.unit_scale(display, size, true);
+        let body = display;
+        bevy::log::info!("exile: dressed {guid:#x} race {race} body {body} scale {scale} (capped {capped})");
+        self.emit(unit_create(walk, scale, guid, EntityKind::Player, display, pos, facing, &fields));
+        guid
+    }
+
     /// `SMSG_NAME_QUERY_RESPONSE`'s stand-in: our own name, an empty one for anyone else.
     fn answer_name(&mut self, guid: u64) {
+        if let Some(name) = self.player_names.get(&guid).cloned() {
+            self.emit(SessionEvent::PlayerName { guid, name, race: 0, gender: 0, class: 1 });
+            return;
+        }
         let me = self.me.clone().filter(|_| Some(guid) == self.self_guid);
         self.emit(SessionEvent::PlayerName {
             guid,
@@ -838,6 +1064,7 @@ impl Bridge {
         match kind {
             "hello" => bevy::log::info!("exile: runtime says hello {data}"),
             "ui.character.list.result" => self.roster_from(data),
+            "ui.mapping.mobs.result" => self.lineup_mobs(data),
             "ui.replay.list.result" => self.replays_to_addon(data),
             "ui.replay.files.result" => self.files_to_addon(data),
             "ui.replay.export.result" => {
@@ -1129,9 +1356,32 @@ impl Bridge {
                     s.walk_start = started;
                 }
             } else {
+                let player = actor["kind"].as_str() == Some("player");
+                let facing = target
+                    .map(|t| (t[0] - pos[0], t[1] - pos[1]))
+                    .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
+                    .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
+                let guid = if actor["dress"].is_object() {
+                    // A dressed humanoid (runtime `Dress`): a player-style unit in its gear.
+                    let name = actor["mob"].as_str().unwrap_or_default().to_owned();
+                    let dress = actor["dress"].clone();
+                    self.dress_create(
+                        &dress,
+                        name,
+                        actor_size(actor),
+                        pos,
+                        facing,
+                        COMBAT_WALK_SPEED,
+                        &[
+                            (FIELD_UNIT_HEALTH, life),
+                            (FIELD_UNIT_MAXHEALTH, max_life),
+                            (FIELD_UNIT_LEVEL, 1),
+                            (FIELD_UNIT_FACTIONTEMPLATE, FACTION_HOSTILE),
+                        ],
+                    )
+                } else {
                 let guid = self.next_creature;
                 self.next_creature += 1;
-                let player = actor["kind"].as_str() == Some("player");
                 let key = actor["model"].as_str().unwrap_or("Kobold").to_owned();
                 let display = self.models.resolve(&key);
                 let scale = self.models.unit_scale(
@@ -1139,10 +1389,6 @@ impl Bridge {
                     actor_size(actor),
                     actor["oversize"].as_bool() == Some(true),
                 );
-                let facing = target
-                    .map(|t| (t[0] - pos[0], t[1] - pos[1]))
-                    .filter(|(tx, ty)| tx.hypot(*ty) > 0.05)
-                    .map_or(0.0, |(tx, ty)| wow_facing(tx, ty));
                 self.emit(unit_create(
                     COMBAT_WALK_SPEED,
                     scale,
@@ -1161,6 +1407,8 @@ impl Bridge {
                         ),
                     ],
                 ));
+                guid
+                };
                 self.shown.insert(
                     id.to_owned(),
                     Shown {
@@ -1256,6 +1504,100 @@ fn wow_facing(dx: f32, dy: f32) -> f32 {
 fn angle_gap(a: f32, b: f32) -> f32 {
     let d = (a - b).rem_euclid(std::f32::consts::TAU);
     d.min(std::f32::consts::TAU - d)
+}
+
+/// A race and sex's own body (`ChrRaces.dbc` male/female display): what a dressed unit wears its
+/// gear on.
+fn native_display(race: u32, gender: u32) -> u32 {
+    let (male, female) = match race {
+        1 => (49, 50),
+        2 => (51, 52),
+        3 => (53, 54),
+        4 => (55, 56),
+        5 => (57, 58),
+        6 => (59, 60),
+        7 => (1563, 1564),
+        8 => (1478, 1479),
+        _ => (49, 50),
+    };
+    if gender == 1 { female } else { male }
+}
+
+/// The item template a dressed unit's gear points at: only what drawing it needs, its
+/// `ItemDisplayInfo` id, slot family (`InventoryType`), class and subclass.
+fn item_info(display: u32, inventory_type: u32, class: u32, subclass: u32) -> ItemInfo {
+    ItemInfo {
+        class,
+        subclass,
+        name: String::new(),
+        display_info_id: display,
+        quality: 1,
+        flags: 0,
+        buy_price: 0,
+        sell_price: 0,
+        inventory_type,
+        allowable_class: -1,
+        allowable_race: -1,
+        item_level: 1,
+        required_level: 0,
+        required_skill: 0,
+        required_skill_rank: 0,
+        required_spell: 0,
+        required_honor_rank: 0,
+        required_city_rank: 0,
+        required_rep_faction: 0,
+        required_rep_rank: 0,
+        max_count: 0,
+        stackable: 1,
+        container_slots: 0,
+        stats: Vec::new(),
+        damages: Vec::new(),
+        dmg_min: 0.0,
+        dmg_max: 0.0,
+        dmg_type: 0,
+        armor: 0,
+        resistances: [0; 6],
+        delay_ms: 0,
+        ammo_type: 0,
+        ranged_mod_range: 0.0,
+        spells: Vec::new(),
+        spell_charges_0: 0,
+        use_spell: None,
+        bonding: 0,
+        description: String::new(),
+        page_text: 0,
+        language_id: 0,
+        page_material: 0,
+        start_quest: 0,
+        lock_id: 0,
+        material: 0,
+        // A two-hander rides on the back, anything else at the side.
+        sheath: if inventory_type == 17 { 1 } else { 3 },
+        random_property: 0,
+        block: 0,
+        item_set: 0,
+        max_durability: 0,
+        area: 0,
+        map: 0,
+        bag_family: 0,
+    }
+}
+
+/// `SMSG_CREATURE_QUERY_RESPONSE`'s stand-in: a creature template's name (`None`: unknown).
+fn creature_name(entry: u32, name: Option<String>) -> SessionEvent {
+    SessionEvent::CreatureName {
+        entry,
+        name,
+        subname: None,
+        creature_type: None,
+        pet_family: 0,
+        rank: 0,
+        type_flags: 0,
+        pet_spell_list: 0,
+        display_id: 0,
+        civilian: false,
+        racial_leader: false,
+    }
 }
 
 /// A unit or player create, as the update stream carries it: `OBJECT_FIELD_TYPE`, the display
