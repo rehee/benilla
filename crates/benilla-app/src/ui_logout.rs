@@ -218,8 +218,11 @@ impl SessionSteps<'_> {
 
     /// The world handle (`0x5ab020`), with a world session to send on.
     fn in_world(&self) -> bool {
+        // Exile mode: the bridge is the world session while the player has a character, its
+        // ports between free mode and a battlefield included (the handle is not re-seated by
+        // them), so the game menu's Logout reaches it (user 2026-11-10).
         self.self_guid.as_ref().is_some_and(|g| g.0.is_some())
-            && self.logout.as_deref().is_some_and(|l| l.world_handle)
+            && (crate::net::exile_mode() || self.logout.as_deref().is_some_and(|l| l.world_handle))
     }
 
     /// `0x5ab049`, on the request's path past the world test: the account-data timers run first

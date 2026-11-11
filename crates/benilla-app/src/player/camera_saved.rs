@@ -174,6 +174,25 @@ pub(crate) fn rebuild_camera(world: &mut World) {
     });
 }
 
+/// Exile of Azeroth: the camera a mode switch (free mode ↔ combat replay) starts with (user
+/// 2026-11-09): a new camera ([`rebuild_camera`]) at the shipped pose, not the player's last one:
+/// behind the arrival facing, the default pitch and zoom, nothing gliding.
+pub(crate) fn exile_reset_camera(world: &mut World) {
+    rebuild_camera(world);
+    world.try_resource_scope(|world, mut rig: Mut<CameraControl>| {
+        let mut cams = world.query_filtered::<&mut FlyCam, With<WorldCamera>>();
+        if let Ok(mut cam) = cams.single_mut(world) {
+            cam.pitch = EXILE_RESET_PITCH;
+        }
+        rig.distance = CAM_DIST_DEFAULT;
+        rig.target_distance = CAM_DIST_DEFAULT;
+        rig.collision_distance = CAM_DIST_DEFAULT;
+    });
+}
+
+/// The spawn camera's pitch (`setup`), radians: about 29° down onto the character.
+const EXILE_RESET_PITCH: f32 = -0.5;
+
 /// Writes the pose to the path the load resolved: by `OnExit(InWorld)` the roster is unwinding.
 fn save(file: &CameraPoseFile, rig: &CameraControl, pitch: f32) {
     let Some(path) = &file.path else {

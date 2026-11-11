@@ -12,6 +12,10 @@ use bevy::prelude::*;
 use crate::creature_anim::NockLatch;
 use crate::entities::BoneAttach;
 
+/// The longest a drawn string may span, yards at scale 1 (times the prop's scale): a bow's tips
+/// (under two yards apart) and the draw to the hand stay inside it.
+const MAX_SPAN: f32 = 2.5;
+
 /// The HandArrow attach id (35, `0x6121b8`): the string's middle point while nocked.
 const HAND_ARROW: u16 = 0x23;
 
@@ -53,8 +57,21 @@ fn draw_bowstrings(
             flex.and_then(|p| p.posed_point(prop, bone, offset))
                 .unwrap_or_else(|| prop.transform_point(offset))
         };
-        let top = tip(bs.top);
-        let bottom = tip(bs.bottom);
+        // Exile deviation (user 2026-11-09: a string ran far past the bow): a bow is under two
+        // yards tip to tip, so a pose that puts its tips further apart (a bone frame from another
+        // rig, a prop not yet placed) falls back to the rigid frame, and a string still that
+        // long is not drawn; the nocked middle stays within reach of the tips.
+        let span = MAX_SPAN * prop.compute_transform().scale.max_element().max(1.0);
+        let sane = |a: Vec3, b: Vec3| a.is_finite() && b.is_finite() && a.distance(b) < span;
+        let (mut top, mut bottom) = (tip(bs.top), tip(bs.bottom));
+        if !sane(top, bottom) {
+            top = prop.transform_point(bs.top.1);
+            bottom = prop.transform_point(bs.bottom.1);
+            if !sane(top, bottom) {
+                continue;
+            }
+        }
+        let mid = (top + bottom) / 2.0;
         let middle = owners
             .get(bs.owner)
             .ok()
@@ -63,7 +80,8 @@ fn draw_bowstrings(
                 let &(bone, offset) = bones.points.get(&HAND_ARROW)?;
                 pose.posed_point(joints.get(pose.joints_root).ok()?, bone, offset)
             })
-            .unwrap_or_else(|| (top + bottom) / 2.0);
+            .filter(|m| sane(*m, mid))
+            .unwrap_or(mid);
         gizmos.line(top, middle, STRING_COLOR);
         gizmos.line(middle, bottom, STRING_COLOR);
     }

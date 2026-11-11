@@ -57,6 +57,24 @@ const MARKER_DISPLAY: u32 = 11_686;
 const MARKER_GUID_BASE: u64 = 0xF130_0000_0080_0000;
 /// How long an area marker stands (its effect's kits play out on it).
 const MARKER_LIFE: Duration = Duration::from_secs(4);
+/// A logged spell (no `DO_NOT_LOG`) per school, named by a damage log so its number shows:
+/// Shoot, Fireball, Lightning Bolt, Frostbolt, Shadow Bolt, Arcane Missiles.
+fn number_spell(school: u8) -> u32 {
+    match school {
+        2 => 133,
+        3 => 403,
+        4 => 116,
+        5 => 686,
+        6 => 7268,
+        _ => 75,
+    }
+}
+
+/// The heal a heal log names when the skill borrowed none (Lesser Heal).
+const HEAL_NUMBER_SPELL: u32 = 2050;
+
+/// How long a slain enemy's corpse lies after DQQ drops it from its frame.
+const CORPSE_LIFE: Duration = Duration::from_secs(3);
 /// Markers can't be targeted or hit: `UNIT_FLAG_NOT_SELECTABLE` (bit 25) | `NON_ATTACKABLE` (0x2).
 const MARKER_FLAGS: u32 = 0x0200_0000 | 0x2;
 /// A DQQ projectile's missile flies this far above the ground (chest height), yards.
@@ -83,6 +101,12 @@ const FIELD_PLAYER_VISIBLE_ITEM_1_0: u16 = 260;
 const VISIBLE_ITEM_STRIDE: u16 = 12;
 /// A dressed unit's item templates: entry = this + the item's `ItemDisplayInfo` id.
 const DRESS_ITEM_BASE: u32 = 800_000;
+/// How long a wand holder keeps the wand raised after a shot before its dagger stance.
+const WAND_STANCE_BACK: Duration = Duration::from_millis(1200);
+/// Dress entries with a sheath of their own sit above the plain ones: `base + display + sheath * stride`.
+const DRESS_SHEATH_STRIDE: u32 = 100_000;
+/// `UNIT_NPC_EMOTESTATE`: a unit's looping emote (`/dance`).
+const FIELD_UNIT_NPC_EMOTESTATE: u16 = 148;
 /// Human faction template (friendly to the player) and a hostile one for enemies.
 const FACTION_PLAYER: u32 = 1;
 const FACTION_HOSTILE: u32 = 14;
@@ -107,6 +131,8 @@ const DEFAULT_CLEAR: f32 = 200.0;
 const PREPARE_WAIT: Duration = Duration::from_secs(5);
 /// The lineup's creature entries (names) start here, clear of any real template.
 const LINEUP_ENTRY: u32 = 900_000;
+/// Combat creatures' entries, one per name ([`Bridge::combat_entries`]).
+const COMBAT_ENTRY: u32 = 910_000;
 
 
 /// Units and players whose model has not built yet ([`count_unembodied`]): a combat's start
@@ -125,6 +151,11 @@ pub(super) fn count_unembodied(
         .filter(|n| matches!(n.kind, EntityKind::Unit | EntityKind::Player))
         .count();
     UNEMBODIED.store(n as u32, Ordering::Relaxed);
+}
+
+/// The EoALauncher demo (`EXILE_LOGIN=dqq`): the player types a DQQ account on the login screen.
+pub(crate) fn player_login() -> bool {
+    std::env::var("EXILE_LOGIN").is_ok_and(|v| v.trim().eq_ignore_ascii_case("dqq"))
 }
 
 /// Is Exile mode on? `EXILE_RUNTIME` names the runtime's WebSocket.
@@ -487,12 +518,22 @@ struct Bridge {
     lineup_only: Vec<String>,
     /// Creature template entry → name, answered to `CreatureQuery`.
     creature_names: HashMap<u32, String>,
+    /// A combat creature's name → its creature entry.
+    combat_entries: HashMap<String, u32>,
     /// Dressed units ([`Self::dress_create`]): their names (`NameQuery`), the item templates their
     /// gear points at (`ItemQuery`), and the next guid (a player's high guid, 0, so names resolve
     /// as a player's).
     player_names: HashMap<u64, String>,
+    /// `Emotes.dbc` and `EmotesText.dbc` for the player's `/`-emotes ([`Self::emote_of`]).
+    emote_book: Option<Option<benilla_formats::EmoteSoundCatalog>>,
+    /// What each unit's hands hold as last sent (`UNIT_FIELD_BYTES_2` byte 0), see [`Self::draw`].
+    drawn: HashMap<u64, u32>,
+    /// The looping emote the player holds (`/dance`), 0 none; moving ends it.
+    emote_state: u32,
     /// Each roster entry's hero `dress` (look and gear), worn by the player's own unit.
     hero_dress: HashMap<u64, Value>,
+    /// A `ui.character.list` asked by the addon's Reload Gear: its answer re-dresses the own unit.
+    gear_refresh: bool,
     /// The battlefield's centre (runtime `combat.prepare.result`, PLAN-0006 E; [`BATTLE_CENTER`]
     /// until one comes), where free mode returns to (`.goto` moves it), and a replay trip waiting
     /// on its battlefield (given up at the deadline: the default field).
@@ -504,12 +545,17 @@ struct Bridge {
     /// Units whose only weapon is ranged (a bow in the ranged slot): they fight with it drawn
     /// (sheath state 2, the bow in the left hand), not a melee draw.
     ranged: HashSet<u64>,
+    /// Units holding a mainhand wand (user 2026-11-10): their stance is melee (a dagger's), drawn
+    /// ranged only to shoot, and back to melee [`WAND_STANCE_BACK`] after the last shot.
+    wands: HashSet<u64>,
+    /// When each wand holder goes back to its melee stance.
+    wand_back: HashMap<u64, Instant>,
     /// `.replay <scene>`: the next trip's battlefield scene, over the recording's own.
     scene_override: Option<String>,
     prepare_due: Option<Instant>,
     /// The shown combat's heroes (`combat.begin` `heroes`): DQQ actor id → `dress` from the seed.
     heroes: HashMap<String, Value>,
-    dress_items: HashMap<u32, (u32, u32, u32, u32)>,
+    dress_items: HashMap<u32, (u32, u32, u32, u32, u32)>,
     next_dressed: u64,
     /// Invisible markers standing at skill areas' centres, each cast from for its effect and
     /// removed when its time is up (PLAN-0006 D).
@@ -524,6 +570,10 @@ struct Bridge {
     next_marker: u64,
     /// DQQ projectiles in flight (PLAN-0006 D): id → (launch marker, flying marker, position).
     projectiles: HashMap<String, (u64, u64, [f32; 3])>,
+    /// Projectiles gone from DQQ's frame whose riding unit still lingers ([`PROJECTILE_LINGER`]):
+    /// DQQ id → (rider, where it was, until). A hit logged in the frame the projectile ends on
+    /// still finds its projectile to cast from (user 2026-11-10).
+    recent_projectiles: HashMap<String, (u64, [f32; 3], Instant)>,
 }
 
 impl Bridge {
@@ -565,8 +615,15 @@ impl Bridge {
             lineup: Vec::new(),
             lineup_only: Vec::new(),
             creature_names: HashMap::new(),
+            combat_entries: HashMap::new(),
             player_names: HashMap::new(),
+            emote_book: None,
+            emote_state: 0,
+            drawn: HashMap::new(),
+            wands: HashSet::new(),
+            wand_back: HashMap::new(),
             hero_dress: HashMap::new(),
+            gear_refresh: false,
             heroes: HashMap::new(),
             battle: BATTLE_CENTER,
             home: ORIGIN,
@@ -583,6 +640,7 @@ impl Bridge {
             channels: HashMap::new(),
             next_marker: 0,
             projectiles: HashMap::new(),
+            recent_projectiles: HashMap::new(),
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -690,12 +748,24 @@ impl Bridge {
             }
             // Where the player stands, for the lineup.
             ClientCommand::Move { pos, orientation, .. } => {
+                // A dance ends when the player moves off the spot.
+                if self.emote_state != 0
+                    && self.me_at.is_some_and(|(p, _)| (p[0] - pos[0]).hypot(p[1] - pos[1]) > 0.05)
+                {
+                    self.emote_state = 0;
+                    if let Some(me) = self.self_guid {
+                        self.emit(SessionEvent::ObjectValues {
+                            guid: me,
+                            fields: ObjectFields::from_pairs(&[(FIELD_UNIT_NPC_EMOTESTATE, 0)]),
+                        });
+                    }
+                }
                 self.me_at = Some((*pos, *orientation));
             }
             // A unit's name: the entries this bridge filed (`creature_names`); any other unknown.
             ClientCommand::ItemQuery { entry, .. } => {
                 bevy::log::info!("exile: item query {entry} known {}", self.dress_items.contains_key(entry));
-                let info = self.dress_items.get(entry).map(|&(d, inv, c, sc)| Box::new(item_info(d, inv, c, sc)));
+                let info = self.dress_items.get(entry).map(|&(d, inv, c, sc, sh)| Box::new(item_info(d, inv, c, sc, sh)));
                 self.emit(SessionEvent::ItemTemplate { entry: *entry, info });
             }
             ClientCommand::CreatureQuery { entry, .. } => {
@@ -704,6 +774,39 @@ impl Bridge {
             }
             // Names: the player's own (addon lines name it as their sender); any other is unknown.
             ClientCommand::NameQuery { guid } => self.answer_name(*guid),
+            // The game menu's Logout (user 2026-11-10): back to the character list at once, the
+            // roster asked afresh (`ui.character.list`), a replay in progress stopped.
+            ClientCommand::Logout | ClientCommand::ForceLogout => self.logout(),
+            // `/wave`, `/dance`… in free mode (user 2026-11-09): no server echoes them, so the
+            // bridge does, as vmangos would (`SMSG_TEXT_EMOTE` to the performer; the client plays
+            // its animation, voice and chat line). During a replay the body is the replay's.
+            ClientCommand::TextEmote { text_id, target } if self.phase == Phase::Free => {
+                let Some(me) = self.self_guid else { return };
+                let target_name = self.player_names.get(target).cloned().unwrap_or_default();
+                self.emit(SessionEvent::TextEmote { guid: me, text_emote: *text_id, target_name });
+                // Its animation, as vmangos's `HandleTextEmoteOpcode`: a looping state emote
+                // (`EmoteSpecProc` 2, `/dance`) sets `UNIT_NPC_EMOTESTATE` until the player moves;
+                // a one-shot (`/wave`) is an `SMSG_EMOTE`; a posture (`/sit`) is the client's own.
+                let (emote, spec) = self.emote_of(*text_id);
+                match (emote, spec) {
+                    (0, _) | (_, 1) => {}
+                    (e, 2) => {
+                        self.emote_state = e;
+                        self.emit(SessionEvent::ObjectValues {
+                            guid: me,
+                            fields: ObjectFields::from_pairs(&[(FIELD_UNIT_NPC_EMOTESTATE, e)]),
+                        });
+                    }
+                    (e, _) => {
+                        self.emit(SessionEvent::Emote { guid: me, emote_id: e });
+                    }
+                }
+            }
+            ClientCommand::Emote { emote } if self.phase == Phase::Free => {
+                if let Some(me) = self.self_guid {
+                    self.emit(SessionEvent::Emote { guid: me, emote_id: *emote });
+                }
+            }
             // The Exile UI addon's requests (`docs/bridge-protocol.md` §4).
             ClientCommand::AddonMessage { text, .. } => {
                 if let Some(msg) = text.strip_prefix(ADDON_PREFIX).and_then(|t| t.strip_prefix('\t')) {
@@ -880,9 +983,7 @@ impl Bridge {
         if !fields.iter().any(|(f, _)| *f == FIELD_UNIT_LEVEL) {
             fields.push((FIELD_UNIT_LEVEL, 1));
         }
-        if Self::ranged_only(dress) {
-            self.ranged.insert(guid);
-        }
+        self.hands(guid, dress);
         self.player_names.insert(guid, name.clone());
         self.emit(SessionEvent::PlayerName { guid, name, race, gender, class: 1 });
         // A humanoid like the hero: its own scale times the size, without the footprint cap (a
@@ -896,9 +997,84 @@ impl Bridge {
     }
 
     /// Whether a `dress` holds a ranged weapon (slot 17) and nothing in the main hand (15).
+    /// A ranged hero: a ranged weapon and no melee one, or a bow that is also its mainhand (the
+    /// same display in both slots: user 2026-11-09, a bow is a two-hander held in the left hand).
     fn ranged_only(dress: &Value) -> bool {
-        let slots: Vec<u64> = dress["items"].as_array().into_iter().flatten().filter_map(|i| i["slot"].as_u64()).collect();
-        slots.contains(&17) && !slots.contains(&15)
+        let display = |slot: u64| {
+            dress["items"].as_array().into_iter().flatten().find(|i| i["slot"].as_u64() == Some(slot)).map(|i| i["displayId"].as_u64())
+        };
+        match (display(17), display(15)) {
+            (Some(_), None) => true,
+            (Some(r), Some(m)) => r == m,
+            _ => false,
+        }
+    }
+
+    /// Leave the world for the character list: no camp timer (`instant`), as a resting player's
+    /// logout; the world's units, markers and any replay go, and the select screen's enumerate
+    /// fetches the characters again.
+    fn logout(&mut self) {
+        if self.phase != Phase::Free || self.combat.is_some() {
+            self.send("combat.stop", Value::Null);
+        }
+        let me = self.self_guid;
+        self.engaged.clear();
+        let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
+        for guid in guids {
+            self.emit(SessionEvent::ObjectDestroyed(guid));
+        }
+        let markers: Vec<u64> = self.markers.drain(..).map(|m| m.0).collect();
+        for guid in markers {
+            super::set_beam_tint(guid, None);
+            super::set_muted(guid, false);
+            self.emit(SessionEvent::ObjectDestroyed(guid));
+        }
+        self.marker_casts.clear();
+        self.marker_channels.clear();
+        self.channels.clear();
+        self.projectiles.clear();
+        self.recent_projectiles.clear();
+        benilla_world::exile_clear::set_clear_zone(None);
+        (self.prepare_due, self.combat_due, self.clear_due) = (None, None, None);
+        self.combat = None;
+        self.focus = None;
+        self.phase = Phase::Free;
+        super::set_exile_spectating(false);
+        self.emote_state = 0;
+        self.drawn.clear();
+        self.wand_back.clear();
+        self.gear_refresh = false;
+        bevy::log::info!("exile: logout — back to the character list");
+        self.emit(SessionEvent::LogoutResponse { reason: 0, instant: true });
+        self.emit(SessionEvent::LoggedOut);
+        self.self_guid = None;
+    }
+
+    /// What a unit's dress puts in its hands: [`Self::ranged`] for a ranged hero, and
+    /// [`Self::wands`] for a mainhand wand (a ranged twin that fights in a dagger's stance).
+    fn hands(&mut self, guid: u64, dress: &Value) {
+        self.ranged.remove(&guid);
+        self.wands.remove(&guid);
+        if Self::ranged_only(dress) {
+            self.ranged.insert(guid);
+            let wand = dress["items"].as_array().into_iter().flatten()
+                .any(|i| i["slot"].as_u64() == Some(17) && i["inventoryType"].as_u64() == Some(26) && i["itemSubclass"].as_u64() == Some(19));
+            if wand {
+                self.wands.insert(guid);
+            }
+        }
+    }
+
+    /// A bow hero's hands for this event: drawn ranged to shoot, drawn melee to swing the bow
+    /// (`UNIT_FIELD_BYTES_2` byte 0, which rules during a replay).
+    fn draw(&mut self, guid: u64, state: u32) {
+        if self.drawn.get(&guid) != Some(&state) {
+            self.drawn.insert(guid, state);
+            self.emit(SessionEvent::ObjectValues {
+                guid,
+                fields: ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, state)]),
+            });
+        }
     }
 
     /// A `dress`'s look and gear as descriptor fields (`PLAYER_BYTES`, `PLAYER_BYTES_2`, each
@@ -918,17 +1094,32 @@ impl Bridge {
             if slot > 18 || shown == 0 {
                 continue;
             }
-            let entry = DRESS_ITEM_BASE + shown;
-            let template = (shown, m("inventoryType"), m("itemClass"), m("itemSubclass"));
+            // The sheath (`sheath`, 0 = by kind) is part of the template: the same model can ride
+            // at the side for one item and on the back for another, so it keys the entry too.
+            let sheath = m("sheath");
+            let entry = DRESS_ITEM_BASE + shown + sheath * DRESS_SHEATH_STRIDE;
+            let template = (shown, m("inventoryType"), m("itemClass"), m("itemSubclass"), sheath);
             if self.dress_items.insert(entry, template) != Some(template) {
                 self.emit(SessionEvent::ItemTemplate {
                     entry,
-                    info: Some(Box::new(item_info(template.0, template.1, template.2, template.3))),
+                    info: Some(Box::new(item_info(template.0, template.1, template.2, template.3, template.4))),
                 });
             }
             fields.push((FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot as u16, entry));
         }
         fields
+    }
+
+    /// A text emote's `Emotes.dbc` id and its `EmoteSpecProc` (0 one-shot, 1 posture, 2 looping
+    /// state); `(0, 0)` for a chat-only one or without the DBCs. The catalog loads on first use.
+    fn emote_of(&mut self, text_id: u32) -> (u32, u32) {
+        if self.emote_book.is_none() {
+            let book = self.models.chain.as_mut().and_then(|c| benilla_formats::load_emote_sound_catalog(c).ok());
+            self.emote_book = Some(book);
+        }
+        let Some(Some(book)) = &self.emote_book else { return (0, 0) };
+        let emote = book.text_emote(text_id).unwrap_or(0);
+        (emote, book.spec_proc(emote).unwrap_or(0))
     }
 
     /// `SMSG_NAME_QUERY_RESPONSE`'s stand-in: our own name, an empty one for anyone else.
@@ -986,6 +1177,11 @@ impl Bridge {
                 self.replay_file = Some(file.to_owned());
                 self.replay_id = None;
                 self.start_replay();
+            }
+            // Fetch the character from DQQ again and wear its current gear (user 2026-11-09).
+            "character.refresh" => {
+                self.gear_refresh = true;
+                self.send("ui.character.list", Value::Null);
             }
             other => bevy::log::warn!("exile: unknown addon request {other:?}"),
         }
@@ -1179,6 +1375,12 @@ impl Bridge {
     /// The delayed auto replay, and the clear and the way home after a combat.
     fn timers(&mut self) {
         let now = Instant::now();
+        // A wand holder back in its dagger stance a moment after its last shot.
+        let back: Vec<u64> = self.wand_back.iter().filter(|(_, t)| now >= **t).map(|(g, _)| *g).collect();
+        for guid in back {
+            self.wand_back.remove(&guid);
+            self.draw(guid, 1);
+        }
         let (due, waiting): (Vec<_>, Vec<_>) = self.marker_casts.drain(..).partition(|c| now >= c.3);
         self.marker_casts = waiting;
         for (caster, target, spell, _) in due {
@@ -1192,6 +1394,7 @@ impl Bridge {
                 fields: ObjectFields::from_pairs(&[(FIELD_UNIT_CHANNEL_SPELL, 0)]),
             });
         }
+        self.recent_projectiles.retain(|_, r| now < r.2);
         let (due, waiting): (Vec<_>, Vec<_>) = self.marker_channels.drain(..).partition(|c| now >= c.3);
         self.marker_channels = waiting;
         for (caster, object, spell, _) in due {
@@ -1272,11 +1475,11 @@ impl Bridge {
                 self.engaged.insert(guid, victim);
                 self.emit(SessionEvent::AttackStart { attacker: guid, victim });
                 // Weapons in hand while fighting (`UNIT_FIELD_BYTES_2` byte 0: 1 melee, 2 ranged).
-                let sheath = if self.ranged.contains(&guid) { 2 } else { 1 };
-                self.emit(SessionEvent::ObjectValues {
-                    guid,
-                    fields: ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, sheath)]),
-                });
+                let sheath = if self.ranged.contains(&guid) && !self.wands.contains(&guid) { 2 } else { 1 };
+                if sheath == 2 {
+                    bevy::log::info!("exile: unit {guid:#x} engages with its ranged weapon drawn");
+                }
+                self.draw(guid, sheath);
             }
         }
     }
@@ -1308,14 +1511,38 @@ impl Bridge {
         }
     }
 
-    /// The env login: no realmd, so the logon succeeds at once and the one realm is listed.
-    fn on_login(&mut self, _req: &LoginRequest) {
-        for stage in [
-            LoginStage::Connecting,
-            LoginStage::Authenticating,
-            LoginStage::CheckingVersions,
-            LoginStage::ProofSent,
-        ] {
+    /// A logon. No realmd: with `EXILE_LOGIN=dqq` (the EoALauncher demo) the typed account and
+    /// password go to the runtime, which logs on to DQQ online and answers `auth.login.result`;
+    /// otherwise (the dev run, whose runtime logged on with the test account) it succeeds at once.
+    fn on_login(&mut self, req: &LoginRequest) {
+        self.emit(SessionEvent::LoginStage { stage: LoginStage::Connecting });
+        self.emit(SessionEvent::LoginStage { stage: LoginStage::Authenticating });
+        if player_login() {
+            self.send("auth.login", json!({ "user": req.user, "password": req.pass }));
+            return;
+        }
+        self.logged_on();
+    }
+
+    /// The runtime's answer to a typed logon: the realm, or the login screen's refusal.
+    fn on_auth(&mut self, data: &Value) {
+        if data["ok"].as_bool() == Some(true) {
+            self.logged_on();
+            return;
+        }
+        let code = data["code"].as_str().unwrap_or_default();
+        bevy::log::warn!("exile: DQQ logon refused ({code}): {}", data["error"]);
+        self.emit(SessionEvent::LoginFailed {
+            // 0x05: the account or password is wrong; 0x01: the server could not log us on.
+            refusal: Some(benilla_protocol::LoginRefusal::Logon(if code == "credentials" { 0x05 } else { 0x01 })),
+            reason: format!("DQQ logon refused ({code})"),
+            dial: None,
+        });
+    }
+
+    /// The logon succeeded: the one realm is listed.
+    fn logged_on(&mut self) {
+        for stage in [LoginStage::CheckingVersions, LoginStage::ProofSent] {
             self.emit(SessionEvent::LoginStage { stage });
         }
         self.emit(SessionEvent::RealmList {
@@ -1356,6 +1583,12 @@ impl Bridge {
         let data = &msg["data"];
         match kind {
             "hello" => bevy::log::info!("exile: runtime says hello {data}"),
+            "auth.login.result" => self.on_auth(data),
+            // In the world the list is a refresh (the addon's Reload Gear): the own unit's gear.
+            "ui.character.list.result" if self.gear_refresh => {
+                self.gear_refresh = false;
+                self.refresh_self(data);
+            }
             "ui.character.list.result" => self.roster_from(data),
             "ui.mapping.mobs.result" => self.lineup_mobs(data),
             "combat.prepare.result" => self.port_to_battle(Some(data)),
@@ -1368,6 +1601,8 @@ impl Bridge {
             }
             "combat.begin" => {
                 self.combat = data["combatId"].as_str().map(str::to_owned);
+                self.drawn.clear();
+                self.wand_back.clear();
                 (self.frames, self.moves, self.turns) = (0, 0, 0);
                 (self.ready_first, self.ready_quiet, self.ready_sent) = (None, None, false);
                 (self.flag_moved, self.flag_still, self.noflag_moved) = (0, 0, 0);
@@ -1474,6 +1709,40 @@ impl Bridge {
         });
     }
 
+    /// The addon's Reload Gear: the playing character's entry in a fresh `ui.character.list`
+    /// replaces its gear; in free mode the own unit wears it now (every slot set, so what came off
+    /// comes off), during a replay it waits for the trip home (`create_self`).
+    fn refresh_self(&mut self, list: &Value) {
+        let Some(me) = self.self_guid else { return };
+        let Some(id) = self.dqq_ids.get(&me).cloned() else { return };
+        let Some(entry) = list.as_array().into_iter().flatten().find(|c| c["id"].as_str() == Some(id.as_str())) else {
+            self.addon_say("error;This character is no longer on the account.");
+            return;
+        };
+        let dress = entry["dress"].clone();
+        if !dress.is_object() {
+            return;
+        }
+        self.hero_dress.insert(me, dress.clone());
+        let count = dress["items"].as_array().map_or(0, Vec::len);
+        bevy::log::info!("exile: reloaded character {id}: {count} item(s)");
+        if self.phase != Phase::Free {
+            self.addon_say("character;Gear reloaded; worn after the replay.");
+            return;
+        }
+        self.hands(me, &dress);
+        let worn = self.dress_fields(&dress);
+        let mut fields = Vec::new();
+        for slot in 0..19u16 {
+            let field = FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot;
+            let entry = worn.iter().find(|(f, _)| *f == field).map_or(0, |(_, e)| *e);
+            fields.push((field, entry));
+        }
+        fields.extend(worn.into_iter().filter(|(f, _)| *f < FIELD_PLAYER_VISIBLE_ITEM_1_0));
+        self.emit(SessionEvent::ObjectValues { guid: me, fields: ObjectFields::from_pairs(&fields) });
+        self.addon_say(&format!("character;Gear reloaded ({count} item(s))."));
+    }
+
     /// Entering the world as roster entry `guid`: the session starts, the login position, and the
     /// player's own unit: free mode (D27). `EXILE_AUTOCOMBAT=1` (unattended tests) starts the replay
     /// trip by itself after [`AUTOCOMBAT_DELAY`].
@@ -1518,7 +1787,10 @@ impl Bridge {
             (FIELD_UNIT_LEVEL, me.level as u32),
             (FIELD_UNIT_FACTIONTEMPLATE, FACTION_PLAYER),
             (FIELD_UNIT_BYTES_0, bytes0),
+            // Home with weapons away (a replay may have ended with a bow drawn).
+            (FIELD_UNIT_BYTES_2, 0),
         ];
+        self.drawn.insert(guid, 0);
         // The hero's look and gear (`equipment.json`, through the roster).
         if let Some(dress) = self.hero_dress.get(&me.guid).cloned() {
             fields.extend(self.dress_fields(&dress));
@@ -1578,15 +1850,17 @@ impl Bridge {
                 if let Some(me) = self.self_guid {
                     let from = self.ground.on_ground(self.battle);
                     // The hero is the human female standard: her size is her scale.
-                    let mut fields = vec![(FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits())];
+                    // Weapons away to start (`UNIT_FIELD_BYTES_2` byte 0): the engage's draw is
+                    // then a change the anim layer adopts, even when the last combat ended drawn.
+                    let mut fields = vec![(FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits()), (FIELD_UNIT_BYTES_2, 0)];
+                    self.drawn.insert(me, 0);
                     // The seed's gear (user 2026-11-07: combat shows the recording's character),
                     // every held and worn slot set, so what the seed lacks comes off. Home again,
                     // `create_self` puts the roster's gear back.
                     self.ranged.remove(&me);
+                    self.wands.remove(&me);
                     if let Some(dress) = self.heroes.get(id).cloned() {
-                        if Self::ranged_only(&dress) {
-                            self.ranged.insert(me);
-                        }
+                        self.hands(me, &dress);
                         bevy::log::debug!("exile: hero {id} seed dress {dress}, ranged {}", self.ranged.contains(&me));
                         let worn = self.dress_fields(&dress);
                         for slot in 0..19u16 {
@@ -1735,6 +2009,15 @@ impl Bridge {
                     actor_size(actor),
                     actor["oversize"].as_bool() == Some(true),
                 );
+                // Its name (the DQQ mob's, else the actor's): a creature entry per name, filed
+                // ahead of the unit, whose name query asks by it (it read "Unknown" without).
+                let name = actor["mob"].as_str().or(actor["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or("Enemy").to_owned();
+                let next = COMBAT_ENTRY + self.combat_entries.len() as u32;
+                let entry = *self.combat_entries.entry(name.clone()).or_insert(next);
+                if entry == next {
+                    self.creature_names.insert(entry, name.clone());
+                    self.emit(creature_name(entry, Some(name)));
+                }
                 self.emit(unit_create(
                     COMBAT_WALK_SPEED,
                     scale,
@@ -1744,6 +2027,7 @@ impl Bridge {
                     pos,
                     facing,
                     &[
+                        (FIELD_OBJECT_ENTRY, entry),
                         (FIELD_UNIT_HEALTH, life),
                         (FIELD_UNIT_MAXHEALTH, max_life),
                         (FIELD_UNIT_LEVEL, 1),
@@ -1774,7 +2058,19 @@ impl Bridge {
         for key in gone {
             if let Some(s) = self.shown.remove(&key) {
                 self.engaged.remove(&s.guid);
-                self.emit(SessionEvent::ObjectDestroyed(s.guid));
+                if s.enemy {
+                    // DQQ drops a slain enemy from its frame at once: it dies first (health 0, so
+                    // its death animation and cry play) and its corpse lies a moment.
+                    if s.life > 0 {
+                        self.emit(SessionEvent::ObjectValues {
+                            guid: s.guid,
+                            fields: ObjectFields::from_pairs(&[(FIELD_UNIT_HEALTH, 0)]),
+                        });
+                    }
+                    self.markers.push((s.guid, Instant::now() + CORPSE_LIFE));
+                } else {
+                    self.emit(SessionEvent::ObjectDestroyed(s.guid));
+                }
             }
         }
         self.keep_engaged();
@@ -1800,7 +2096,9 @@ impl Bridge {
         let amount = ev["amount"].as_f64().unwrap_or(0.0).ceil().max(1.0) as u32;
         // A channel (§2.2): the caster holds the channel spell's directed channel pose while the
         // skill's events keep coming, and stops a moment after the last.
-        if action == "channel" && spell != 0 && matches!(ev["kind"].as_str(), Some("CastSkill" | "DamageTaken")) {
+        // A spinning channel (Spin + Channel, user 2026-11-10) holds the same way: its channel kit
+        // spins the body with the whirl and its whoosh looping on it.
+        if matches!(action, "channel" | "spinChannel") && spell != 0 && matches!(ev["kind"].as_str(), Some("CastSkill" | "DamageTaken")) {
             let caster = ev["from"].as_str().and_then(|id| self.shown.get(id)).map(|s| s.guid);
             if let Some(caster) = caster {
                 self.hold_channel(caster, spell);
@@ -1818,6 +2116,12 @@ impl Bridge {
                     return;
                 }
                 let target = guid_of("target").unwrap_or(caster);
+                if matches!(action, "shoot" | "wandShoot") && self.ranged.contains(&caster) {
+                    self.draw(caster, 2);
+                    if self.wands.contains(&caster) {
+                        self.wand_back.insert(caster, Instant::now() + WAND_STANCE_BACK);
+                    }
+                }
                 if ev["hit"].as_bool() == Some(false) {
                     // Only the cast (a fire nova's own burst does no harm: user 2026-11-07).
                     self.cast_only(caster, spell);
@@ -1844,6 +2148,47 @@ impl Bridge {
                 let Some(at) = at else { return };
                 let scale = ev["scale"].as_f64().unwrap_or(1.0) as f32;
                 self.area_effect(at, scale, spell);
+            }
+            // A spinning skill's projectile reaching its enemies (user 2026-11-10): the projectile
+            // (the unit riding its path) casts the spin there, its whirl and whoosh; gone already,
+            // it plays at the spot.
+            "SkillRangeAndTarget" if action == "projectileSpin" && spell != 0 => {
+                let now = Instant::now();
+                let rider = ev["from"].as_str().and_then(|id| {
+                    self.projectiles.get(id).map(|p| (p.1, p.2)).or_else(|| {
+                        self.recent_projectiles.get(id).filter(|r| now < r.2).map(|r| (r.0, r.1))
+                    })
+                });
+                bevy::log::info!("exile: projectile spin {spell}: {}", if rider.is_some() { "cast by the projectile" } else { "projectile gone, cast at the spot" });
+                if let Some((rider, at)) = rider {
+                    // The rider flies at body height; the whirl stands on the ground, so the rider
+                    // is set down where it is before it casts.
+                    let ground = self.ground.on_ground(at);
+                    self.spline_id = self.spline_id.wrapping_add(1);
+                    self.emit(SessionEvent::MonsterMove {
+                        guid: rider,
+                        transport: None,
+                        start: at,
+                        spline_id: self.spline_id,
+                        path: vec![at, ground],
+                        facing: MonsterMoveFacing::None,
+                        stop: true,
+                        duration_ms: 1,
+                        flying: true,
+                        run_mode: true,
+                    });
+                    let id = ev["from"].as_str().unwrap_or_default().to_owned();
+                    if let Some(p) = self.projectiles.get_mut(&id) {
+                        p.2 = ground;
+                    }
+                    self.cast_only(rider, spell);
+                    return;
+                }
+                let at = match (ev["centerX"].as_f64(), ev["centerY"].as_f64()) {
+                    (Some(x), Some(y)) => self.to_world(x, y),
+                    _ => return,
+                };
+                self.area_effect(at, 1.0, spell);
             }
             // A scatter's ray (user 2026-11-07): from where the scatter starts — the area's centre,
             // a fireball's burst — to where it ends (the unit it reaches, else the area's edge), its
@@ -1904,6 +2249,11 @@ impl Bridge {
                 let Some(victim) = guid_of("target") else { return };
                 let attacker = guid_of("from").unwrap_or(victim);
                 if matches!(action, "melee" | "mobAttack") && attacker != victim {
+                    // A bow hero's melee attack swings the bow two-handed (user 2026-11-09).
+                    if self.ranged.contains(&attacker) {
+                        self.draw(attacker, 1);
+                        self.wand_back.remove(&attacker);
+                    }
                     self.emit(SessionEvent::AttackerState(AttackerState {
                         attacker,
                         victim,
@@ -1919,27 +2269,48 @@ impl Bridge {
                     }));
                     return;
                 }
+                let periodic = action == "none";
+                if !periodic {
+                    // A spell's hit has no swing: the victim's wound vocal (Exile deviation).
+                    super::push_wound(victim, crit);
+                }
                 self.emit(SessionEvent::SpellDamageLog(SpellDamageLog {
                     target: victim,
                     attacker,
-                    spell_id: spell,
+                    // The number needs a logged spell: the borrowed one may be a channel's
+                    // (`DO_NOT_LOG`) or none, so the log names a plain spell of the school.
+                    spell_id: number_spell(school),
                     damage: amount,
                     school,
                     absorb: 0,
                     resist: 0,
                     // A duration's tick (no skill): the periodic number.
-                    periodic: action == "none",
+                    periodic,
                     blocked: 0,
                     // SPELL_HIT_TYPE_CRIT.
                     hit_info: if crit { 0x2 } else { 0 },
                 }));
+            }
+            // A death the frame has not shown yet (the unit still stands in DQQ's frame).
+            "Killed" | "ActorIsDown" => {
+                let Some(id) = ev["target"].as_str() else { return };
+                if let Some(s) = self.shown.get_mut(id) {
+                    if s.life > 0 {
+                        s.life = 0;
+                        let guid = s.guid;
+                        self.emit(SessionEvent::ObjectValues {
+                            guid,
+                            fields: ObjectFields::from_pairs(&[(FIELD_UNIT_HEALTH, 0)]),
+                        });
+                    }
+                }
             }
             "HealingTaken" => {
                 let Some(target) = guid_of("target") else { return };
                 self.emit(SessionEvent::SpellHealLog(SpellHealLog {
                     target,
                     healer: guid_of("from").unwrap_or(target),
-                    spell_id: spell,
+                    spell_id: if spell == 0 { HEAL_NUMBER_SPELL } else { spell },
                     amount,
                     critical: crit,
                 }));
@@ -1994,11 +2365,14 @@ impl Bridge {
         }
         let gone: Vec<String> = self.projectiles.keys().filter(|k| !seen.contains(*k)).cloned().collect();
         for id in gone {
-            if let Some((a, b, _)) = self.projectiles.remove(&id) {
+            if let Some((a, b, pos)) = self.projectiles.remove(&id) {
                 // Left standing a moment: the missile still homing on `b` lands first.
                 let at = Instant::now() + PROJECTILE_LINGER;
                 self.markers.push((a, at));
-                self.markers.push((b, at));
+                if b != a {
+                    self.markers.push((b, at));
+                }
+                self.recent_projectiles.insert(id, (b, pos, at));
             }
         }
     }
@@ -2183,7 +2557,7 @@ fn native_display(race: u32, gender: u32) -> u32 {
 
 /// The item template a dressed unit's gear points at: only what drawing it needs, its
 /// `ItemDisplayInfo` id, slot family (`InventoryType`), class and subclass.
-fn item_info(display: u32, inventory_type: u32, class: u32, subclass: u32) -> ItemInfo {
+fn item_info(display: u32, inventory_type: u32, class: u32, subclass: u32, sheath: u32) -> ItemInfo {
     ItemInfo {
         class,
         subclass,
@@ -2229,8 +2603,19 @@ fn item_info(display: u32, inventory_type: u32, class: u32, subclass: u32) -> It
         start_quest: 0,
         lock_id: 0,
         material: 0,
-        // A two-hander rides on the back, anything else at the side.
-        sheath: if inventory_type == 17 { 1 } else { 3 },
+        // Where it rides sheathed (`ItemTemplate.sheath`): the item's own (`equipment.json`
+        // `sheath`), else as 1.12's items of its kind: a shield on the back (4), a staff upright
+        // on the back (2), another two-hander slung across it (1), anything else at the side (3).
+        sheath: if sheath != 0 {
+            sheath
+        } else {
+            match (inventory_type, class, subclass) {
+                (14, ..) => 4,
+                (17, 2, 10) => 2,
+                (17, ..) => 1,
+                _ => 3,
+            }
+        },
         random_property: 0,
         block: 0,
         item_set: 0,

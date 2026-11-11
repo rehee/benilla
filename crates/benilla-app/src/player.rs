@@ -92,7 +92,7 @@ pub(crate) struct ControlRestore;
 // The last writer of a self body part's render alpha: `entities::apply_unit_mat_alpha` orders
 // itself before it.
 pub(crate) use camera::apply_self_model_fade;
-pub(crate) use camera_saved::{camera_at_interface_load, rebuild_camera};
+pub(crate) use camera_saved::{camera_at_interface_load, exile_reset_camera, rebuild_camera};
 use controller::control;
 pub(crate) use controller::LookSample;
 // The private camera and `state` items are re-imported for the modules beside this one, which
@@ -367,6 +367,14 @@ impl Plugin for PlayerPlugin {
                     .after(WorldFocusSet)
                     .in_set(crate::vm_pass::VmPass::Member),
             );
+        // Exile of Azeroth: a mode switch (free mode ↔ combat replay) is a worldport, and the
+        // camera starts over there (user 2026-11-09), as a `/reload`'s new camera does.
+        app.add_systems(
+            Update,
+            exile_camera_on_port
+                .after(control)
+                .in_set(crate::client_state::InWorldGated),
+        );
         app.init_resource::<camera::LookConfig>();
         app.init_resource::<camera_zoom::ZoomLimit>();
         app.init_resource::<camera::FollowConfig>();
@@ -556,5 +564,15 @@ fn mirror_mover_collision_height(
         if player.collision_height != h {
             player.collision_height = h;
         }
+    }
+}
+
+/// Exile of Azeroth: each worldport (the bridge ports the player between free mode and the
+/// battlefield) resets the camera once `control` has applied it: behind the arrival facing, the
+/// default pitch and zoom, the glides stopped ([`exile_reset_camera`]).
+fn exile_camera_on_port(mut ports: MessageReader<crate::net::WorldportMessage>, mut commands: Commands) {
+    if ports.read().count() > 0 && crate::net::exile_mode() {
+        info!("exile: worldport — new camera");
+        commands.queue(|world: &mut World| exile_reset_camera(world));
     }
 }

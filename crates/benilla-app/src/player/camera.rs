@@ -1351,7 +1351,7 @@ pub(super) fn run_look_session(
         }
     }
     let motion = if sync_look_focus(rig, focused, window, cursor_opts) {
-        mouse_motion.delta
+        sane_mouse_delta(mouse_motion.delta)
     } else {
         Vec2::ZERO
     };
@@ -1454,6 +1454,9 @@ pub(super) fn run_look_session(
         // The pivot's fork (`0x50fee0`): a pinned camera looking level or up, dragged mostly
         // vertically, spends the delta on the pitch bias; `None` means the integrator does not run.
         let d_pitch = -dy * pitch_rate;
+        if d_pitch.abs() > 0.3 {
+            warn!("camera: one frame of mouse look moved the pitch {d_pitch:.3} rad (mouse delta {delta:?})");
+        }
         if let Some(d_pitch) = rig.smart_pivot.route_pitch(
             d_pitch,
             d_yaw,
@@ -1558,6 +1561,9 @@ impl CameraControl {
     /// left orbit's as a right drag's.
     pub(super) fn hand_off_ground_pitch(&mut self, cam: &mut FlyCam) {
         let handed = self.terrain_tilt.hand_off(self.look.is_some());
+        if handed.abs() > 0.3 {
+            warn!("camera: the ground lean handed {handed:.3} rad to the pitch (look {:?})", self.look);
+        }
         if handed != 0.0 {
             cam.pitch = (cam.pitch + handed).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
         }
@@ -1775,6 +1781,53 @@ pub(super) fn seat_camera(
             t.rotation = rotation;
             t.translation = translation;
             cam_t.set_changed();
+        }
+    }
+    // Exile of Azeroth diagnosis (user 2026-11-09: while dragging the view and moving, the camera
+    // sometimes jumps to looking straight down): a pitch jump between two frames is logged with
+    // what the frame had, so the source can be told apart (mouse, ground lean, view flight).
+    {
+        // The pitch the picture shows (bias and ground lean included), beside the rig's own.
+        static LAST_VIEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+        let view = (rotation * Vec3::NEG_Z).y.clamp(-1.0, 1.0).asin();
+        let last_view = LAST_VIEW.swap(view.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        if last_view != u32::MAX && (view - f32::from_bits(last_view)).abs() > 0.3 {
+            warn!(
+                "camera: the view's pitch jumped {:.3} → {:.3} rad in one frame (rig pitch {:.3}, look {:?}, \
+                 dist {:.2}, coll {:.2}, clipped {}, seat [{:.1},{:.1},{:.1}] head [{:.1},{:.1},{:.1}])",
+                f32::from_bits(last_view),
+                view,
+                cam.pitch,
+                rig.look,
+                rig.distance,
+                rig.collision_distance,
+                rig.clipped,
+                translation.x,
+                translation.y,
+                translation.z,
+                head.x,
+                head.y,
+                head.z,
+            );
+        }
+        static LAST_PITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+        let last = LAST_PITCH.swap(cam.pitch.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        if last != u32::MAX {
+            let jump = cam.pitch - f32::from_bits(last);
+            if jump.abs() > 0.3 {
+                warn!(
+                    "camera: pitch jumped {:.3} → {:.3} rad in one frame (dt {:.3}s, look {:?}, view flight {}, \
+                     dist {:.2}, coll {:.2}, clipped {})",
+                    f32::from_bits(last),
+                    cam.pitch,
+                    dt,
+                    rig.look,
+                    rig.view_blend.pitch_target(cam.pitch) != cam.pitch,
+                    rig.distance,
+                    rig.collision_distance,
+                    rig.clipped,
+                );
+            }
         }
     }
     // The eye is never moved for liquid, as in the reference (no liquid-height query in
@@ -2067,6 +2120,19 @@ pub(super) fn fly_free(
         };
         cam_t.translation += dir.normalize() * cam.speed * boost * dt;
     }
+}
+
+/// Exile of Azeroth (user 2026-11-09): a frame's mouse delta with an absolute sample in it is
+/// dropped. Windows raw input can deliver a `MOUSE_MOVE_ABSOLUTE` report (0..65535 screen
+/// coordinates, seen as deltas like (32972, 24150)), which turned the camera ~70 rad in one frame
+/// and pinned the pitch straight down. No hand moves a mouse that far in one frame.
+fn sane_mouse_delta(delta: Vec2) -> Vec2 {
+    const MAX_FRAME_DELTA: f32 = 4000.0;
+    if delta.x.abs() > MAX_FRAME_DELTA || delta.y.abs() > MAX_FRAME_DELTA {
+        warn!("camera: dropped a mouse delta of {delta:?} (an absolute sample, not a move)");
+        return Vec2::ZERO;
+    }
+    delta
 }
 
 /// `WOW_CAM_DUMP`: the per-frame camera and turn dump, read once per process.

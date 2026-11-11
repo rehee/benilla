@@ -53,6 +53,9 @@ pub(crate) struct Wielded {
     /// `UNIT_FIELD_FLAGS & UNIT_FLAG_DISARMED`, replicated for every unit; the reference reads it
     /// inside `GetWeapon` (`[[unit+0x110]+0xa0] & 0x200000`), for creatures as for players.
     pub(crate) disarmed: bool,
+    /// Exile deviation (user 2026-11-09): the mainhand is the hero's bow, held in the left hand,
+    /// so its draw and stow play on the left arm.
+    pub(crate) main_left: bool,
 }
 
 /// `UNIT_FIELD_FLAGS` bit 21 (vmangos `UnitDefines.h:566`), tested inside `GetWeapon` at

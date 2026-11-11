@@ -74,6 +74,18 @@ pub(crate) fn muted(guid: u64) -> bool {
     MUTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&guid))
 }
 
+/// Exile deviation: spell damage the bridge plays (PLAN-0006 D) has no swing, so the victim's
+/// wound vocal is queued here by guid (`crit`) and played by `sound::combat` like a swing's.
+static WOUNDS: std::sync::Mutex<Vec<(u64, bool)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn push_wound(guid: u64, crit: bool) {
+    WOUNDS.lock().unwrap_or_else(|e| e.into_inner()).push((guid, crit));
+}
+
+pub(crate) fn take_wounds() -> Vec<(u64, bool)> {
+    std::mem::take(&mut *WOUNDS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 pub(crate) fn beam_tint(guid: u64) -> Option<[f32; 3]> {
     BEAM_TINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&guid).copied()
 }

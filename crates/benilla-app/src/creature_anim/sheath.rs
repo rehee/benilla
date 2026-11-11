@@ -234,13 +234,23 @@ fn ranged_arm(w: &Wielded) -> Option<usize> {
     })
 }
 
+/// The arm the mainhand draws and stows with: the right, or the left for an Exile hero's bow
+/// ([`Wielded::main_left`]); the offhand takes the other.
+pub(super) fn main_arm(w: &Wielded) -> usize {
+    if w.main_left {
+        ARM_LEFT
+    } else {
+        ARM_RIGHT
+    }
+}
+
 /// The draw leg one arm plays for a committed state, as the drawers `0x6118a0` (right),
 /// `0x611960` (left) and `0x611a20` (both) pick it; `None` releases the arm to its idle.
 fn draw_leg(arm: usize, cur: u8, w: &Wielded) -> Option<ArmLeg> {
     let (item, sheath) = match (cur, arm) {
         // The drawers read `GetWeapon(slot, 0)`: a disarmed hand has nothing to draw (`0x5eb480`).
-        (1, ARM_RIGHT) => (w.armed_main(), w.main_sheath),
-        (1, ARM_LEFT) => (w.armed_off(), w.off_sheath),
+        (1, a) if a == main_arm(w) => (w.armed_main(), w.main_sheath),
+        (1, _) => (w.armed_off(), w.off_sheath),
         // The ranged weapon draws on exactly one arm; the other has no leg at all.
         (2, _) if ranged_arm(w) == Some(arm) => (w.ranged, w.ranged_sheath),
         _ => return None,
@@ -277,16 +287,17 @@ pub(super) fn sheath_phase1(prev: u8, cur: u8, w: &Wielded) -> [Option<ArmLeg>; 
     match prev {
         // Nothing in hand to put away: both arms draw at once (`0x611ce6` to `0x611a20`).
         0 => [draw_leg(ARM_RIGHT, cur, w), draw_leg(ARM_LEFT, cur, w)],
-        1 => [
-            match w.armed_main() {
-                Some(_) => stow(w.main_sheath),
-                None => sheath_phase2(ARM_RIGHT, prev, cur, w),
-            },
-            match w.armed_off() {
-                Some(_) => stow(w.off_sheath),
-                None => sheath_phase2(ARM_LEFT, prev, cur, w),
-            },
-        ],
+        1 => [ARM_RIGHT, ARM_LEFT].map(|arm| {
+            let held = if arm == main_arm(w) {
+                w.armed_main().map(|_| w.main_sheath)
+            } else {
+                w.armed_off().map(|_| w.off_sheath)
+            };
+            match held {
+                Some(sheath) => stow(sheath),
+                None => sheath_phase2(arm, prev, cur, w),
+            }
+        }),
         2 => match ranged_arm(w) {
             None => [draw_leg(ARM_RIGHT, cur, w), draw_leg(ARM_LEFT, cur, w)],
             Some(ARM_LEFT) => [sheath_phase2(ARM_RIGHT, prev, cur, w), Some(RANGED_STOW)],
@@ -333,6 +344,7 @@ fn arm_leg(
     arm: usize,
     leg: ArmLeg,
     state: u8,
+    main_left: bool,
     player: &mut AnimationPlayer,
     anims: &ModelAnimations,
     catalog: Option<&AnimDataCatalog>,
@@ -357,7 +369,14 @@ fn arm_leg(
             .unwrap_or(c.duration * 0.5),
         drawing: leg.drawing,
         // A ranged state moves the ranged slot; otherwise the arm is the slot.
-        slot: if state == 2 { 2 } else { arm as u8 },
+        // (An Exile hero's bow: the left arm moves the mainhand.)
+        slot: if state == 2 {
+            2
+        } else if main_left {
+            1 - arm as u8
+        } else {
+            arm as u8
+        },
         crossed: false,
     })
 }
@@ -381,7 +400,7 @@ pub(super) fn start_sheath_ceremony(
         let Some(leg) = leg else { continue };
         // A stow leg moves the old state's item; a draw leg, the new state's.
         let state = if leg.drawing { new_state } else { old_state };
-        arms[arm] = arm_leg(arm, leg, state, player, anims, catalog);
+        arms[arm] = arm_leg(arm, leg, state, w.main_left, player, anims, catalog);
     }
     if arms.iter().any(Option::is_some) {
         let swap = SheathSwap {
@@ -442,7 +461,7 @@ pub(super) fn advance_sheath_ceremony(
         swap.arms[arm] = (!drawing)
             .then(|| sheath_phase2(arm, prev, cur, &w))
             .flatten()
-            .and_then(|next| arm_leg(arm, next, cur, player, anims, catalog));
+            .and_then(|next| arm_leg(arm, next, cur, w.main_left, player, anims, catalog));
     }
     if swap.arms.iter().any(Option::is_some) {
         commands.entity(entity).insert(VisualSheath([

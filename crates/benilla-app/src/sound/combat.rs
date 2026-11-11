@@ -301,7 +301,9 @@ fn combat_sounds(
     if last.0.len() > 128 {
         last.0.retain(|e, _| units.contains(*e));
     }
-    if events.is_empty() && contacts.is_empty() && exertions.is_empty() {
+    // Exile: the wounds of spell damage, which has no swing (`crate::net::push_wound`).
+    let wounds = crate::net::take_wounds();
+    if events.is_empty() && contacts.is_empty() && exertions.is_empty() && wounds.is_empty() {
         return;
     }
     let MeleeTables {
@@ -344,6 +346,40 @@ fn combat_sounds(
             warn!("combat {what} (kit {kit}): {e:#}");
         }
     };
+
+    // Exile: a spell's wound plays the victim's injury vocal, as a landed swing does (class 2,
+    // or 3 on a crit), with the same chance roll.
+    for (guid, crit) in wounds {
+        let Some((tr, _, net, ..)) = objects.entity(guid).and_then(|e| units.get(e).ok()) else {
+            continue;
+        };
+        if !crit {
+            let threshold = if net.kind == EntityKind::Player {
+                INJURY_CHANCE_PLAYER
+            } else {
+                INJURY_CHANCE_CREATURE
+            };
+            if !bark_chance_pass(threshold, kits.roll()) {
+                continue;
+            }
+        }
+        let vocal = net
+            .display_id
+            .and_then(|d| voices.0.for_display(d))
+            .map(|v| v.injury[usize::from(crit)])
+            .unwrap_or(0);
+        play(
+            &mut kits,
+            &mut out,
+            vocal,
+            tr.translation,
+            PlayExtras {
+                bus: Bus::INJURY,
+                ..default()
+            },
+            "injury",
+        );
+    }
 
     // `force = 0` (`0x62477e`), so the class roll applies: class 0 is 70 for a creature and 35
     // for a player, class 1 (a crit) 100.

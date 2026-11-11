@@ -280,7 +280,8 @@ fn spawn_slot(
     // The bowstring, for a drawn bow only, the ranged slot in the left hand: `0x611e10` registers
     // `0x611ff0` for subclass Bow. The `$WTT`/`$WTB` markers are not the gate, as melee weapons
     // author them too for the swing trail (`0x6c67f0`).
-    if slot_idx == 2 && hs.attach == attach_id::HAND_LEFT {
+    // Exile: a hero's bow also held as its mainhand two-hander (user 2026-11-09) strings too.
+    if (slot_idx == 2 || (slot_idx == 0 && crate::net::exile_mode())) && hs.attach == attach_id::HAND_LEFT {
         if let Some([top, bottom]) = dm.string_anchors {
             commands.entity(root).insert(crate::bowstring::Bowstring {
                 owner: entity,

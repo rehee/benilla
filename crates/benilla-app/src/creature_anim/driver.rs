@@ -555,6 +555,12 @@ pub(super) fn drive_animations(
         // The creep vis flag off the unit's own descriptor (`[[unit+0x110]+0x213] & 2`), never
         // predicted: the crouch lands with the server's aura.
         mv.stealthed = store.is_some_and(|s| s.0.unit_is_stealthed());
+        // Exile deviation (user 2026-11-10): a spinning channel (Whirlwind's spin, AnimID 126)
+        // outranks locomotion: the unit spins full-body while it travels, its position still
+        // carried by the move.
+        if crate::net::exile_mode() && cast_hold.is_some_and(|h| h.anim_id == EXILE_SPIN_ANIM) {
+            mv.flags &= !move_flags::CAST_PIN_MOVE;
+        }
         let moving = mv.flags & move_flags::ANY_MOVE != 0;
         // An arc's launch vertical speed splits a jump (the JumpStart/Jump bracket; jump
         // `0x60e480`, land `0x602c60`) from a step-off fall, which has no bracket and keeps the
@@ -769,6 +775,12 @@ pub(super) fn drive_animations(
             if !setter_refuses(sheath_byte, fields, classes) {
                 committed.cur = Some(sheath_byte);
             }
+        }
+        // Exile deviation: during a replay the bridge's byte is what the hero holds (a bow drawn
+        // ranged, a sword melee), so it rules every unit, the player's own body included, whose
+        // committed state an earlier free-mode or combat draw may still hold.
+        if crate::net::exile_spectating() && sheath_byte != 0 && committed.cur != Some(sheath_byte) {
+            committed.cur = Some(sheath_byte);
         }
         // The setter: a no-op when unchanged (`newState == CUR`), else commit, volunteer
         // `CMSG_SETSHEATHED` for the local player, and for the manual toggle play the ceremony,
@@ -1491,3 +1503,7 @@ fn anim_cost_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("WOW_ANIM_COST").as_deref() == Ok("1"))
 }
+
+/// Whirlwind's spin (`AnimationData` 126), the one channel clip that outranks locomotion in
+/// Exile mode.
+const EXILE_SPIN_ANIM: u16 = 126;

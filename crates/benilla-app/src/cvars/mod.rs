@@ -969,6 +969,14 @@ fn load_config(world: &mut World) {
         // it is never persisted.
         cvars.own_for_session("gxApi", None);
         cvars.announce_locale_defaults();
+        // Exile of Azeroth: free mode keeps the camera where the player put it while moving
+        // (user 2026-11-09), so the follow style defaults to Never (0) until the player picks one.
+        let exile_camera = crate::net::exile_mode()
+            && match &stored {
+                StoredConfig::Table(t) => !t.keys().any(|k| k.eq_ignore_ascii_case("cameraSmoothStyle")),
+                StoredConfig::Absent => true,
+                StoredConfig::Bad(_) => false,
+            };
         let (file_has_account, can_save) = match &stored {
             StoredConfig::Table(t) => (
                 t.keys().any(|k| k.eq_ignore_ascii_case(CVAR_ACCOUNT_NAME)),
@@ -985,6 +993,10 @@ fn load_config(world: &mut World) {
                 warn!("{msg}");
             }
             StoredConfig::Table(table) => cvars.load_file(table),
+        }
+        if exile_camera {
+            info!("config: Exile mode — cameraSmoothStyle 0 (the camera does not swing back while moving)");
+            let _ = cvars.set("cameraSmoothStyle", "0");
         }
         cvars.adopt_legacy_account(
             crate::local_state::legacy_account_path(),

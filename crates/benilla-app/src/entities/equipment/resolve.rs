@@ -447,6 +447,14 @@ pub(in crate::entities) fn resolve_equipment(
                 _ => {}
             }
         }
+        // Exile deviation (user 2026-11-09): a hero's bow fills the mainhand and the ranged slot
+        // with one display; the mainhand one is held, drawn and stowed with the left hand.
+        // A wand (user 2026-11-10) is the same twin held in the right hand: the mainhand stands in
+        // for a dagger, the ranged one shoots.
+        let twin_main = crate::net::exile_mode()
+            && matches!((resolved[0], resolved[2]), (Some(m), Some(r)) if m.0 == r.0);
+        let bow_main = twin_main && ranged_inv_type == Some(0x0f);
+        wielded.main_left = bow_main;
         // The one hand `UNIT_FLAG_DISARMED` hides, if any.
         let hidden = wielded.disarmed_hand();
         // The rising edge (`0x5ff580` fires on a change); a unit first seen disarmed never had one.
@@ -474,7 +482,27 @@ pub(in crate::entities) fn resolve_equipment(
             // The dress, above the placement gate; its enchants come off the descriptor, since an
             // enchant raises a model event drawn or not and `visual` exists only for a placed slot.
             worn[slot] = Some((display, kind, enchant_fold(s, net_entity.kind, slot)));
-            let live = placement(slot, inv_type, item_sheath, sheath_of(slot, inv_type));
+            let mut live = placement(slot, inv_type, item_sheath, sheath_of(slot, inv_type));
+            // Exile deviation (user 2026-11-09): a hero's bow is one two-hander in both the
+            // mainhand and the ranged slot (the same display): on the back when stowed, in the
+            // left hand drawn melee (a bow's swing), and only the ranged slot's when drawn ranged.
+            if twin_main && slot == 0 {
+                // The arm that holds it (a bow's left, a wand's right): its draw/stow ceremony moves
+                // this one. Stowed it rides by its own sheath type, whatever the other arm (which
+                // has no leg) already reads: the right arm's state put a bow in the right hand while
+                // the left arm still reached for it (user 2026-11-10).
+                let (arm, hand) = if bow_main { (1, attach_id::HAND_LEFT) } else { (0, attach_id::HAND_RIGHT) };
+                live = match sheath_of(arm, inv_type) {
+                    1 => Some(hand),
+                    2 => None,
+                    _ => placement(slot, inv_type, item_sheath, 0),
+                };
+            }
+            // A wand's shot (user 2026-11-10): the offhand (a shield, a held item) stays in its hand
+            // while the ranged twin shoots, instead of going to the back as a ranged draw puts it.
+            if twin_main && !bow_main && slot == 1 && sheath_of(1, inv_type) == 2 {
+                live = Some(if inv_type == 14 { attach_id::SHIELD } else { attach_id::HAND_LEFT });
+            }
             // The hidden hand's weapon stays where the disarm reflex left it (`0x5ff580`).
             let attach = if hidden == Some(slot) {
                 if disarm_edge {
