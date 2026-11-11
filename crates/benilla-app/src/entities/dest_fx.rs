@@ -53,8 +53,11 @@ pub(super) struct GroundFx {
     loop_armed: bool,
     /// One-shot self-termination deadline (`time.elapsed_secs()`), set at attach.
     expires: Option<f32>,
-    /// The sequence to play (`AnimationData` id), else the model's `Stand`.
+    /// An Exile range circle (its lifecycle is held, not repeated); the id is unused.
     anim: Option<u16>,
+    /// The stretch of its opening a range circle keeps playing, seconds: from the first to the
+    /// second, then back; equal, it stands still there.
+    window: Option<(f32, f32)>,
 }
 
 impl GroundFx {
@@ -66,6 +69,7 @@ impl GroundFx {
             loop_armed: false,
             expires: None,
             anim: None,
+            window: None,
         }
     }
 }
@@ -201,6 +205,11 @@ pub(super) struct ExileRing {
 /// end (the aura rings' `Stand` runs about 1.4 s).
 const RING_DRAWN_AT: f32 = 0.8;
 
+/// The stretch of an area model's opening a range circle keeps playing, as fractions of it: past
+/// the spread, before the fade (a burning ground is lava from about a quarter to two thirds in).
+const AREA_FULL_FROM: f32 = 0.3;
+const AREA_FULL_TO: f32 = 0.6;
+
 /// How long a range circle's next pass overlaps the one ending, seconds.
 const RING_OVERLAP: f32 = 0.8;
 
@@ -277,23 +286,29 @@ pub(super) fn exile_ground_rings(
         };
         let path = path.to_string();
         ensure_model(&mut fx, &asset_server, &path);
-        // An aura ring authors `Hold` (158), its steady loop (user 2026-11-11: the range stays lit
-        // while the aura lasts, not pulsing): one instance, held for as long as the circle is
-        // wanted. A model without it (an area burst) plays one pass after another instead, since
-        // its particles and fades run on the clock it was spawned with.
+        // One instance for as long as the circle is wanted (user 2026-11-11: lit while the aura
+        // lasts, not replayed): its opening plays once, then the stretch where it is drawn in full
+        // runs over and over (a burning ground's few seconds of lava), or, for an aura ring
+        // (which authors `Hold`, drawing nothing here), its drawn frame stands still.
         let Some(model) = fx.models.get(&path) else { continue };
         if model.parts.is_none() {
             continue; // still loading: decided once it is in
         }
-        let hold = model
-            .animations
-            .as_ref()
-            .is_some_and(|a| a.find(super::spell_fx::ANIM_HOLD).is_some());
-        info!("exile: range circle {path} under {guid:#x}, scale {scale:.2}, {}", if hold { "held" } else { "one pass" });
-        let mut gfx = GroundFx::new(path, hold);
-        if hold {
-            gfx.anim = Some(super::spell_fx::ANIM_HOLD);
-        }
+        let Some(anims) = model.animations.as_ref() else { continue };
+        let ring_model = anims.find(super::spell_fx::ANIM_HOLD).is_some();
+        let duration = anims.preferred_clip(None).map_or(0.0, |c| c.duration);
+        let window = if ring_model {
+            (RING_DRAWN_AT, RING_DRAWN_AT)
+        } else {
+            (duration * AREA_FULL_FROM, duration * AREA_FULL_TO)
+        };
+        info!(
+            "exile: range circle {path} under {guid:#x}, scale {scale:.2}, held {:.2}..{:.2} s of {duration:.2}",
+            window.0, window.1
+        );
+        let mut gfx = GroundFx::new(path, true);
+        gfx.anim = Some(0);
+        gfx.window = Some(window);
         commands.spawn((
             gfx,
             ExileRing { guid, ring: (spell_id, scale) },
@@ -414,12 +429,15 @@ pub(super) fn attach_ground_fx_models(
         // An Exile range circle stops at its drawn frame, [`RING_DRAWN_AT`] into its opening,
         // and stays so: its fades ride the player's clock, so they hold too (user 2026-11-11:
         // the circle stays lit while the aura lasts, no replay).
-        if inst.anim.is_some() && !inst.loop_armed {
+        if let Some((from, to)) = inst.window {
             if let Some(player) = player.as_mut() {
                 for (_, anim) in player.playing_animations_mut() {
-                    if anim.seek_time() >= RING_DRAWN_AT {
-                        anim.set_speed(0.0);
-                        inst.loop_armed = true;
+                    if anim.seek_time() >= to {
+                        if to - from < 0.05 {
+                            anim.set_speed(0.0);
+                        } else {
+                            anim.seek_to(from);
+                        }
                     }
                 }
             }
