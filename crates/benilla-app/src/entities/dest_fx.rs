@@ -3,6 +3,8 @@
 //! unit kit pipeline (no `PlaySpellVisualKit` `0x60edf0` call site is on this class), and
 //! `SMSG_SPELL_GO` plays a one-shot at the dest point.
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
 
 use crate::creature_anim::{SpellKitSound, SpellVisuals};
@@ -183,8 +185,8 @@ pub(super) fn arm_ground_effects(
 }
 
 /// Exile of Azeroth: a range circle under a unit ([`crate::net::set_ground_ring`]): the area
-/// effect model of a borrowed ground spell (Consecration's circle…), looping, scaled to the range
-/// and kept under the unit as it moves. A deviation: the reference draws these only for a
+/// effect model of a borrowed ground spell (Consecration's circle…), replayed pass after pass,
+/// scaled to the range and kept under the unit as it moves. A deviation: the reference draws these only for a
 /// DynamicObject, unscaled.
 #[derive(Component)]
 pub(super) struct ExileRing {
@@ -192,10 +194,14 @@ pub(super) struct ExileRing {
     ring: (u32, f32),
 }
 
+/// How long a range circle's next pass overlaps the one ending, seconds.
+const RING_OVERLAP: f32 = 0.8;
+
 /// Spawn, follow and remove the range circles.
 pub(super) fn exile_ground_rings(
     mut commands: Commands,
-    mut rings: Query<(Entity, &ExileRing, &mut Transform)>,
+    mut rings: Query<(Entity, &ExileRing, &mut Transform, &GroundFx)>,
+    time: Res<Time>,
     index: Option<Res<crate::net::GuidIndex>>,
     units: Query<&GlobalTransform, Without<ExileRing>>,
     visuals: Option<Res<SpellVisuals>>,
@@ -214,20 +220,36 @@ pub(super) fn exile_ground_rings(
         return;
     }
     let under = |guid: u64| index.0.get(&guid).and_then(|e| units.get(*e).ok()).map(GlobalTransform::translation);
-    for (entity, ring, mut tf) in &mut rings {
-        match (wanted.remove(&ring.guid), under(ring.guid)) {
-            (Some(now), Some(at)) if now == ring.ring => {
+    let now = time.elapsed_secs();
+    // Each circle's newest pass: the next starts [`RING_OVERLAP`] before it ends, so the passes
+    // cross-fade instead of leaving a dim gap.
+    let mut newest: HashMap<u64, Option<f32>> = HashMap::new();
+    let wanted_now = wanted.clone();
+    for (entity, ring, mut tf, gfx) in &mut rings {
+        match (wanted_now.get(&ring.guid), under(ring.guid)) {
+            (Some(now_ring), Some(at)) if *now_ring == ring.ring => {
                 if tf.translation != at {
                     tf.translation = at;
                 }
+                // A pass not yet built (no expiry) counts as fresh.
+                let end = if gfx.spawned { gfx.expires } else { None };
+                let e = newest.entry(ring.guid).or_insert(end);
+                *e = match (*e, end) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
             }
-            (other, _) => {
+            _ => {
+                // Gone, or changed: a changed circle is drawn anew next frame.
                 commands.entity(entity).despawn();
-                // A changed circle is drawn anew next frame.
-                let _ = other;
             }
         }
     }
+    wanted.retain(|guid, _| match newest.get(guid) {
+        None => true,
+        Some(None) => false,
+        Some(Some(end)) => now >= end - RING_OVERLAP,
+    });
     for (guid, (spell_id, scale)) in wanted {
         let Some(at) = under(guid) else { continue };
         let path = spells
@@ -243,9 +265,12 @@ pub(super) fn exile_ground_rings(
         };
         let path = path.to_string();
         ensure_model(&mut fx, &asset_server, &path);
-        info!("exile: range circle {path} under {guid:#x}, scale {scale:.2}");
+        debug!("exile: range circle {path} under {guid:#x}, scale {scale:.2}");
+        // One pass of the model, then a fresh one next frame: its particles and fades run on the
+        // clock it was spawned with, so repeating the clip alone let it fade out for good after
+        // its first pass (user 2026-11-11). A new instance per pass keeps the circle burning.
         commands.spawn((
-            GroundFx::new(path, true),
+            GroundFx::new(path, false),
             ExileRing { guid, ring: (spell_id, scale) },
             Transform::from_translation(at).with_scale(Vec3::splat(scale)),
             Visibility::default(),
@@ -359,10 +384,15 @@ pub(super) fn attach_ground_fx_models(
         // `obj+0x190` bit 1 is set (its source untraced); this repeats the first clip.
         if inst.looping && !inst.loop_armed {
             if let Some(mut player) = player {
+                // Armed only once a clip is playing: the player can land a frame before its clip
+                // starts, and arming then repeated nothing, so the loop played once and faded
+                // (Exile's range circles, user 2026-11-11).
+                let mut armed = false;
                 for (_, anim) in player.playing_animations_mut() {
                     anim.repeat();
+                    armed = true;
                 }
-                inst.loop_armed = true;
+                inst.loop_armed = armed;
             }
         }
         if let Some(expires) = inst.expires {
