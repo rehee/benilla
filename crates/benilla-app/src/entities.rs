@@ -656,7 +656,7 @@ fn publish_world_units(
 /// stop it raised ([`crate::creature_anim::replay_rebuilt_kit_sounds`]).
 fn rebuild_then_start_kits() -> ScheduleConfigs<ScheduleSystem> {
     (
-        (refresh_live_display, live_display::heal_rig_starved).chain(),
+        (live_display::exile_rebuilds, refresh_live_display, live_display::heal_rig_starved).chain(),
         (
             resolve_spell_fx,
             crate::creature_anim::replay_rebuilt_kit_sounds,

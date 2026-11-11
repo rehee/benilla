@@ -63,6 +63,30 @@ pub(super) struct ScaleEase {
     elapsed: f32,
 }
 
+/// Exile deviation (PLAN-0011): the bridge's look changes ([`crate::net::request_rebuild`]).
+/// The same body (skin, face, hair…) re-dresses in place, as a gear change does
+/// (`attach::redress_player_looks` re-composites the atlas and re-picks the geosets off
+/// `PLAYER_BYTES`): its applied gear is cleared so the re-dress runs this frame, nothing torn down.
+/// A new body (race, sex) is the display watcher's rebuild.
+pub(super) fn exile_rebuilds(
+    index: Res<crate::net::GuidIndex>,
+    mut units: Query<(&NetEntity, Option<&mut super::equipment::AppliedEquipment>)>,
+    mut out: MessageWriter<DisplayRebuilt>,
+) {
+    for (guid, display_id) in crate::net::take_due_rebuilds() {
+        let Some(&entity) = index.0.get(&guid) else { continue };
+        if let Ok((net, Some(mut applied))) = units.get_mut(entity) {
+            if net.display_id == Some(display_id) {
+                info!("exile: look re-dress guid {guid:016x}");
+                applied.0 = super::equipment::Equipment::default();
+                continue;
+            }
+        }
+        info!("exile: body rebuild guid {guid:016x} display {display_id}");
+        out.write(DisplayRebuilt { entity, at: crate::lanes::stamp(), display_id });
+    }
+}
+
 /// A unit's rebuild at `at` (`0x60abe0`), short of its body: the loop `0x60ac10` stops every
 /// effect the unit holds, kit sounds included (`0x61fedc`), and the tail replays the morph latch
 /// (`0x60ad67`) off [`DisplaySwapped`].

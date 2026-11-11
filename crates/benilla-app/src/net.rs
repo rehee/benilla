@@ -22,6 +22,7 @@ use benilla_world::schedule::WorldStage;
 mod apply;
 // Exile of Azeroth: the runtime-driven session (rehee/benilla fork).
 mod exile;
+mod exile_wardrobe;
 
 /// Exile of Azeroth mode (`EXILE_RUNTIME` set): the client is driven by the Exile Runtime.
 pub(crate) fn exile_mode() -> bool {
@@ -93,6 +94,25 @@ pub(crate) fn set_ground_ring(guid: u64, ring: Option<(u32, f32)>) {
 
 pub(crate) fn ground_rings() -> HashMap<u64, (u32, f32)> {
     GROUND_RINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
+/// Exile deviation (PLAN-0011): a unit's body rebuilt in place, so a new look (`PLAYER_BYTES`,
+/// read only when a body is built) shows: the barber's mannequin and the own unit. Each waits
+/// [`REBUILD_AFTER`] so the values sent with it are in the unit's store first.
+static REBUILDS: std::sync::Mutex<Vec<(u64, u32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+const REBUILD_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
+
+pub(crate) fn request_rebuild(guid: u64, display: u32) {
+    REBUILDS.lock().unwrap_or_else(|e| e.into_inner()).push((guid, display, std::time::Instant::now()));
+}
+
+/// The rebuilds whose wait is over: (guid, display).
+pub(crate) fn take_due_rebuilds() -> Vec<(u64, u32)> {
+    let mut all = REBUILDS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let due: Vec<(u64, u32)> = all.iter().filter(|r| now - r.2 >= REBUILD_AFTER).map(|r| (r.0, r.1)).collect();
+    all.retain(|r| now - r.2 < REBUILD_AFTER);
+    due
 }
 
 /// Exile deviation: spell damage the bridge plays (PLAN-0006 D) has no swing, so the victim's

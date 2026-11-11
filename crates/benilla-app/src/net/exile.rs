@@ -32,6 +32,7 @@ use benilla_protocol::{
 use crossbeam_channel::{select, unbounded, Receiver, Sender};
 use serde_json::{json, Value};
 
+use super::exile_wardrobe::Wardrobe;
 use super::io::{NetHandles, PingClock};
 use super::{CharRequest, ClientCommand, LoginRequest, ParkRequest, ParkSender, RealmRequest};
 
@@ -560,6 +561,25 @@ struct Bridge {
     hero_dress: HashMap<u64, Value>,
     /// A `ui.character.list` asked by the addon's Reload Gear: its answer re-dresses the own unit.
     gear_refresh: bool,
+    /// The transmog window's looks (PLAN-0011), sorted out of `ItemDisplayInfo.dbc` on first use,
+    /// the catalogue kept for the named items' icons, and the last list asked (answered again when
+    /// the named items arrive).
+    wardrobe: Option<Wardrobe>,
+    item_displays: Option<benilla_formats::ItemDisplayCatalog>,
+    wardrobe_last: Option<(String, usize, String)>,
+    /// `CharCreate`'s dials, for the barber window's ranges (loaded on first use; `Some(None)`: unreadable).
+    char_create: Option<Option<benilla_formats::CharCreateCatalog>>,
+    /// The body the own unit was built with: race, sex and look (`PLAYER_BYTES`'s dials). The
+    /// body is composited when the unit is built and a player's display swap does not rebuild it,
+    /// so a new one needs the unit made again ([`Self::refresh_self`]).
+    own_body: Option<(u8, u8, [u64; 5])>,
+    /// The barber window's preview (PLAN-0011): a dressed unit before the player wearing the
+    /// edited look, with the race and sex it was made as (a new one for a new race or sex; a
+    /// new look rebuilds it in place), removed when the edit ends.
+    mannequin: Option<(u64, (u8, u8))>,
+    /// The port to a battlefield is done but the own unit waits for `combat.begin`, which brings
+    /// the seed's hero to make it as.
+    self_pending: bool,
     /// The battlefield's centre (runtime `combat.prepare.result`, PLAN-0006 E; [`BATTLE_CENTER`]
     /// until one comes), where free mode returns to (`.goto` moves it), and a replay trip waiting
     /// on its battlefield (given up at the deadline: the default field).
@@ -656,6 +676,13 @@ impl Bridge {
             wand_back: HashMap::new(),
             hero_dress: HashMap::new(),
             gear_refresh: false,
+            wardrobe: None,
+            item_displays: None,
+            wardrobe_last: None,
+            char_create: None,
+            own_body: None,
+            mannequin: None,
+            self_pending: false,
             heroes: HashMap::new(),
             battle: BATTLE_CENTER,
             home: ORIGIN,
@@ -852,8 +879,10 @@ impl Bridge {
             ClientCommand::WorldportAck => match self.phase {
                 Phase::Porting => {
                     // A worldport clears the world; the player's own unit comes again, as a server
-                    // re-sends it after the port.
-                    self.create_self(self.ground.on_ground(self.battle), COMBAT_WALK_SPEED);
+                    // re-sends it after the port, but as the seed's hero (user 2026-11-11: the
+                    // combat's bodies are the seed's DTOs, never the free mode's): made when
+                    // `combat.begin` brings the seed's looks.
+                    self.self_pending = true;
                     let id = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned());
                     let replay = self.replay_id.take();
                     let file = self.replay_file.take();
@@ -1125,7 +1154,8 @@ impl Bridge {
             ),
             // Byte 3 is the rest state, 2 normal as every 1.12 character has it: a 0 has no
             // `Exhaustion.dbc` row and `GetRestState()`'s nil raises in `MainMenuBar.lua`.
-            (FIELD_PLAYER_BYTES_2, 2 << 24),
+            // Byte 0 is the facial hair (runtime `dress.facialHair`, PLAN-0011 character look).
+            (FIELD_PLAYER_BYTES_2, n("facialHair") & 0xFF | 2 << 24),
         ];
         for item in dress["items"].as_array().into_iter().flatten() {
             let m = |k: &str| u32::try_from(item[k].as_u64().unwrap_or(0)).unwrap_or(0);
@@ -1222,8 +1252,154 @@ impl Bridge {
                 self.gear_refresh = true;
                 self.send("ui.character.list", Value::Null);
             }
+            // Show or hide the character's own look (PLAN-0011: transmog and skill skins): the
+            // runtime keeps the switch for the gear (refreshed now) and the replays after it.
+            // The addon's Skins state at its load (a /reload or a new login keeps the runtime's
+            // switch in step with the button): no re-dress.
+            "skins.sync" => {
+                let on = parts.next() != Some("0");
+                self.send("ui.skins", json!({ "skins": on }));
+            }
+            "skins" => {
+                let on = parts.next() != Some("0");
+                self.gear_refresh = true;
+                self.send("ui.character.list", json!({ "skins": on }));
+            }
+            // The barber window (PLAN-0011, user 2026-11-11): the own look and the dials' ranges.
+            "look.get" => {
+                let (race, gender, guid) = self.me.as_ref().map_or((1, 0, 0), |m| (m.race, m.gender, m.guid));
+                let dress = self.hero_dress.get(&guid).cloned().unwrap_or(Value::Null);
+                let n = |k: &str| dress[k].as_u64().unwrap_or(0);
+                let line = format!(
+                    "look;{race};{gender};{};{};{};{};{}",
+                    n("skin"),
+                    n("face"),
+                    n("hair"),
+                    n("hairColor"),
+                    n("facialHair")
+                );
+                self.addon_say(&line);
+                self.say_limits(race, gender);
+            }
+            "look.limits" => {
+                let race = parts.next().and_then(|p| p.parse().ok()).unwrap_or(1u8);
+                let gender = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0u8);
+                self.say_limits(race, gender);
+            }
+            // A dial turned: previewed by the runtime (not saved until `edit.save`).
+            "look.set" => {
+                let v: Vec<u64> = parts.map(|p| p.parse().unwrap_or(0)).collect();
+                if v.len() < 7 {
+                    return;
+                }
+                self.edit_char(json!({ "look": {
+                    "race": v[0],
+                    "gender": if v[1] == 1 { "female" } else { "male" },
+                    "skin": v[2], "face": v[3], "hair": v[4], "hairColor": v[5], "facialHair": v[6],
+                } }));
+            }
+            // The transmog window (PLAN-0011): the runtime's named items, a slot's looks by page.
+            "tm.open" => self.send("ui.wow.items", Value::Null),
+            "tm.list" => {
+                let slot = parts.next().unwrap_or("head").to_owned();
+                let page = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0usize);
+                let search = parts.next().unwrap_or_default().to_owned();
+                self.wardrobe_last = Some((slot.clone(), page, search.clone()));
+                self.tm_list(&slot, page, &search);
+            }
+            // A look picked for a slot (`hide`: show nothing there, `clear`: the DQQ gear again).
+            "tm.set" => {
+                let slot = parts.next().unwrap_or_default().to_owned();
+                let key = parts.next().unwrap_or_default().to_owned();
+                let value = match key.as_str() {
+                    "hide" => json!({ "hide": true }),
+                    "clear" => Value::Null,
+                    k => {
+                        self.load_wardrobe();
+                        let found = self.wardrobe.as_ref().and_then(|w| w.find(&slot, k)).map(|l| l.value.clone());
+                        match found {
+                            Some(value) => value,
+                            None => {
+                                self.addon_say("error;That look is not in the list.");
+                                return;
+                            }
+                        }
+                    }
+                };
+                let mut transmog = serde_json::Map::new();
+                transmog.insert(slot, value);
+                self.edit_char(json!({ "transmog": transmog }));
+            }
+            // The skill skins window (PLAN-0011): the skills that take a skin and their choices.
+            "sk.list" => {
+                let Some(id) = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned()) else { return };
+                self.send("ui.skill.skins", json!({ "characterId": id }));
+            }
+            // A skill's range circle picked (`default`: the mapping's own).
+            "sk.set" => {
+                let skill = parts.next().unwrap_or_default().to_owned();
+                let pick = parts.next().unwrap_or_default();
+                let value = if pick == "default" || pick.is_empty() { Value::Null } else { json!({ "ring": pick }) };
+                let mut skills = serde_json::Map::new();
+                skills.insert(skill, value);
+                self.edit_char(json!({ "skills": skills }));
+            }
+            // Keep the edits (DQQ `WoWCharConfig`) or drop them.
+            "edit.save" | "edit.cancel" => {
+                let Some(id) = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned()) else { return };
+                let kind = if msg.starts_with("edit.save") { "ui.character.save" } else { "ui.character.cancel" };
+                self.send(kind, json!({ "characterId": id }));
+            }
             other => bevy::log::warn!("exile: unknown addon request {other:?}"),
         }
+    }
+
+    /// One barber or transmog edit for the playing character (runtime `ui.character.edit`): the
+    /// runtime answers with the character as it would look, worn at once ([`Self::refresh_self`]).
+    fn edit_char(&mut self, change: Value) {
+        let Some(id) = self.self_guid.and_then(|g| self.dqq_ids.get(&g).cloned()) else { return };
+        self.send("ui.character.edit", json!({ "characterId": id, "change": change }));
+    }
+
+    /// The barber dials' counts for a race and sex (`CharCreate`'s ranges) to the addon.
+    fn say_limits(&mut self, race: u8, gender: u8) {
+        if self.char_create.is_none() {
+            let catalog = self.models.chain.as_mut().and_then(|c| benilla_formats::CharCreateCatalog::load(c).ok());
+            self.char_create = Some(catalog);
+        }
+        let ranges = self.char_create.as_ref().and_then(Option::as_ref).and_then(|c| c.ranges(race, gender));
+        let (a, b, c, d, e) = ranges.map_or((10, 10, 10, 10, 10), |r| (r.skin, r.face, r.hair_style, r.hair_color, r.facial_hair));
+        self.addon_say(&format!("limits;{race};{gender};{a};{b};{c};{d};{e}"));
+    }
+
+    /// The transmog window's looks, sorted out of `ItemDisplayInfo.dbc` the first time.
+    fn load_wardrobe(&mut self) {
+        if self.wardrobe.is_some() {
+            return;
+        }
+        if let Some(catalog) = self.models.chain.as_mut().and_then(|c| benilla_formats::load_item_display_catalog(c).ok()) {
+            self.wardrobe = Some(Wardrobe::build(&catalog));
+            self.item_displays = Some(catalog);
+        }
+    }
+
+    /// One page of a slot's looks to the addon: `tm.begin;slot;page;pages`, a `tm;key;icon;name`
+    /// row each, `tm.end`.
+    fn tm_list(&mut self, slot: &str, page: usize, search: &str) {
+        self.load_wardrobe();
+        let Some(wardrobe) = self.wardrobe.as_ref() else {
+            self.addon_say("error;The item looks could not be read.");
+            return;
+        };
+        let (rows, pages) = wardrobe.page(slot, page, search);
+        let page = page.min(pages - 1);
+        let lines: Vec<String> =
+            rows.iter().map(|l| format!("tm;{};{};{}", l.key, l.icon, l.name.replace([';', '|'], " "))).collect();
+        self.addon_say(&format!("tm.begin;{slot};{page};{pages}"));
+        for line in lines {
+            self.addon_say(&line);
+        }
+        self.addon_say("tm.end");
     }
 
     /// A line to the Exile UI addon: an addon message (`LANG_ADDON`) on the party lane, sent by
@@ -1627,7 +1803,45 @@ impl Bridge {
             // In the world the list is a refresh (the addon's Reload Gear): the own unit's gear.
             "ui.character.list.result" if self.gear_refresh => {
                 self.gear_refresh = false;
-                self.refresh_self(data);
+                self.refresh_self(data, None);
+            }
+            // The barber and transmog windows (PLAN-0011): a preview, the saved look, or back to it.
+            "ui.character.edit.result" => self.refresh_self(data, Some("")),
+            "ui.character.save.result" => self.refresh_self(data, Some("Look saved.")),
+            "ui.character.cancel.result" => self.refresh_self(data, Some("Changes discarded.")),
+            // `sk.begin`, a `sk;skill;label;kind;current;default;option,option…` row each, `sk.end`.
+            "ui.skill.skins.result" => {
+                self.addon_say("sk.begin");
+                for e in data.as_array().into_iter().flatten() {
+                    let s = |k: &str| e[k].as_str().unwrap_or_default().replace([';', '|', ','], " ");
+                    let options: Vec<String> = e["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(|o| o.replace([';', '|', ','], " "))
+                        .collect();
+                    let line = format!(
+                        "sk;{};{};{};{};{};{}",
+                        s("skill"),
+                        s("label"),
+                        s("kind"),
+                        s("current"),
+                        s("default"),
+                        options.join(",")
+                    );
+                    self.addon_say(&line);
+                }
+                self.addon_say("sk.end");
+            }
+            "ui.wow.items.result" => {
+                self.load_wardrobe();
+                if let Some(wardrobe) = self.wardrobe.as_mut() {
+                    wardrobe.set_named(data, self.item_displays.as_ref());
+                }
+                if let Some((slot, page, search)) = self.wardrobe_last.clone() {
+                    self.tm_list(&slot, page, &search);
+                }
             }
             "ui.character.list.result" => self.roster_from(data),
             "ui.mapping.mobs.result" => self.lineup_mobs(data),
@@ -1652,6 +1866,11 @@ impl Bridge {
                     .as_object()
                     .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default();
+                // The own unit, as the seed's creator (its race, look and gear then).
+                if std::mem::take(&mut self.self_pending) {
+                    let dress = self.focus.as_ref().and_then(|f| self.heroes.get(f)).cloned();
+                    self.create_self_as(self.ground.on_ground(self.battle), COMBAT_WALK_SPEED, dress);
+                }
                 bevy::log::info!("exile: combat begins {data}");
             }
             "combat.frame" => {
@@ -1680,6 +1899,10 @@ impl Bridge {
             }
             "error" => {
                 bevy::log::error!("exile: runtime error {data}");
+                // A combat that never began still owes the player a body.
+                if std::mem::take(&mut self.self_pending) {
+                    self.create_self(self.ground.on_ground(self.battle), COMBAT_WALK_SPEED);
+                }
                 let text = data["message"].as_str().unwrap_or("runtime error").replace([';', '|'], " ");
                 self.addon_say(&format!("error;{text}"));
             }
@@ -1722,7 +1945,7 @@ impl Bridge {
                 face,
                 hair_style,
                 hair_color,
-                facial_hair: 0,
+                facial_hair: look("facialHair"),
                 level: c["level"].as_u64().unwrap_or(1).clamp(1, 60) as u8,
                 new_character: false,
                 zone: 9, // Northshire Valley
@@ -1752,7 +1975,8 @@ impl Bridge {
     /// The addon's Reload Gear: the playing character's entry in a fresh `ui.character.list`
     /// replaces its gear; in free mode the own unit wears it now (every slot set, so what came off
     /// comes off), during a replay it waits for the trip home (`create_self`).
-    fn refresh_self(&mut self, list: &Value) {
+    /// `note`: what the addon is told (`None` the Reload Gear line, `""` nothing: a preview).
+    fn refresh_self(&mut self, list: &Value, note: Option<&str>) {
         let Some(me) = self.self_guid else { return };
         let Some(id) = self.dqq_ids.get(&me).cloned() else { return };
         let Some(entry) = list.as_array().into_iter().flatten().find(|c| c["id"].as_str() == Some(id.as_str())) else {
@@ -1766,8 +1990,34 @@ impl Bridge {
         self.hero_dress.insert(me, dress.clone());
         let count = dress["items"].as_array().map_or(0, Vec::len);
         bevy::log::info!("exile: reloaded character {id}: {count} item(s)");
+        // The character config's body (PLAN-0011 barber): race, sex and look. A preview shows it on
+        // a mannequin; anything else that brings a new body makes the own unit again (below).
+        let race = u8::try_from(dress["race"].as_u64().unwrap_or(1)).unwrap_or(1).max(1);
+        let gender = u8::try_from(dress["gender"].as_u64().unwrap_or(0)).unwrap_or(0).min(1);
+        let body = (race, gender, body_look(&dress));
+        let preview = note == Some("");
+        // The mannequin stays through a preview (its body is rebuilt in place, below); anything
+        // else, or a preview of the own body, takes it away.
+        if let Some((old, _)) = self.mannequin {
+            if !(preview && self.own_body != Some(body)) {
+                self.emit(SessionEvent::ObjectDestroyed(old));
+                self.mannequin = None;
+            }
+        }
+        if !preview {
+            if let Some(m) = self.me.as_mut() {
+                m.race = race;
+                m.gender = gender;
+            }
+            if let Some(entry) = self.roster.iter_mut().find(|c| c.guid == me) {
+                entry.race = race;
+                entry.gender = gender;
+            }
+        }
         if self.phase != Phase::Free {
-            self.addon_say("character;Gear reloaded; worn after the replay.");
+            if note != Some("") {
+                self.addon_say("character;Gear reloaded; worn after the replay.");
+            }
             return;
         }
         self.hands(me, &dress);
@@ -1778,9 +2028,73 @@ impl Bridge {
             let entry = worn.iter().find(|(f, _)| *f == field).map_or(0, |(_, e)| *e);
             fields.push((field, entry));
         }
-        fields.extend(worn.into_iter().filter(|(f, _)| *f < FIELD_PLAYER_VISIBLE_ITEM_1_0));
+        let look_fields: Vec<(u16, u32)> = worn.iter().copied().filter(|(f, _)| *f < FIELD_PLAYER_VISIBLE_ITEM_1_0).collect();
+        // A preview leaves the own unit's look alone (the mannequin shows it).
+        if !preview {
+            fields.extend(look_fields.iter().copied());
+        }
         self.emit(SessionEvent::ObjectValues { guid: me, fields: ObjectFields::from_pairs(&fields) });
-        self.addon_say(&format!("character;Gear reloaded ({count} item(s))."));
+        let display = native_display(u32::from(race), u32::from(gender));
+        if self.own_body != Some(body) {
+            if preview {
+                if let Some((guid, _)) = self.mannequin {
+                    // The new body (race, sex, `PLAYER_BYTES`, gear) on the mannequin, rebuilt in
+                    // place: no fade out and in (user 2026-11-11).
+                    let mut pairs = look_fields.clone();
+                    pairs.extend([
+                        (FIELD_UNIT_BYTES_0, u32::from(race) | 1 << 8 | u32::from(gender) << 16 | 1 << 24),
+                        (FIELD_UNIT_DISPLAYID, display),
+                        (FIELD_UNIT_NATIVEDISPLAYID, display),
+                    ]);
+                    for slot in 0..19u16 {
+                        let field = FIELD_PLAYER_VISIBLE_ITEM_1_0 + VISIBLE_ITEM_STRIDE * slot;
+                        let entry = worn.iter().find(|(f, _)| *f == field).map_or(0, |(_, e)| *e);
+                        pairs.push((field, entry));
+                    }
+                    self.emit(SessionEvent::ObjectValues { guid, fields: ObjectFields::from_pairs(&pairs) });
+                    super::request_rebuild(guid, display);
+                } else {
+                    // A new race or sex: a mannequin three yards before the player, facing them.
+                    let (at, o) = self.me_at.unwrap_or((self.home, 0.0));
+                    let pos = self.ground.on_ground([at[0] + o.cos() * 3.0, at[1] + o.sin() * 3.0, at[2]]);
+                    let facing = (o + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+                    let guid = self.dress_create(&dress, "Preview".to_owned(), 1.0, pos, facing, FREE_WALK_SPEED, &[]);
+                    self.mannequin = Some((guid, (race, gender)));
+                }
+                if let Some(m) = self.mannequin.as_mut() {
+                    m.1 = (race, gender);
+                }
+            } else if self.own_body.is_some() {
+                // A new body (saved or reloaded): the own unit rebuilt in place, its race and sex
+                // (`UNIT_FIELD_BYTES_0`, the display) and look (user 2026-11-11: no reload).
+                bevy::log::info!("exile: own body {:?} -> {body:?}: rebuilt in place", self.own_body);
+                self.own_body = Some(body);
+                let class = self.me.as_ref().map_or(1, |m| u32::from(m.class));
+                self.emit(SessionEvent::ObjectValues {
+                    guid: me,
+                    fields: ObjectFields::from_pairs(&[
+                        (FIELD_UNIT_BYTES_0, u32::from(race) | class << 8 | u32::from(gender) << 16),
+                        (FIELD_UNIT_DISPLAYID, display),
+                        (FIELD_UNIT_NATIVEDISPLAYID, display),
+                    ]),
+                });
+                super::request_rebuild(me, display);
+            } else {
+                // A new body (saved or reloaded): the own unit made again where it stands, as
+                // entering the world does (a worldport to the spot, `Phase::Returning`).
+                bevy::log::info!("exile: own body {:?} -> {body:?}: entering the world again", self.own_body);
+                if let Some((at, _)) = self.me_at {
+                    self.home = at;
+                }
+                self.emit(SessionEvent::Worldport { map_id: self.home_map, position: self.home, orientation: 0.0, needs_ack: true });
+                self.phase = Phase::Returning;
+            }
+        }
+        match note {
+            None => self.addon_say(&format!("character;Gear reloaded ({count} item(s)).")),
+            Some("") => {}
+            Some(text) => self.addon_say(&format!("character;{text}")),
+        }
     }
 
     /// Entering the world as roster entry `guid`: the session starts, the login position, and the
@@ -1819,8 +2133,21 @@ impl Bridge {
 
     /// The player's own unit at `pos`: at world entry and again after every worldport.
     fn create_self(&mut self, pos: [f32; 3], walk: f32) {
-        let (Some(guid), Some(me)) = (self.self_guid, self.me.clone()) else { return };
+        let dress = self.me.as_ref().and_then(|m| self.hero_dress.get(&m.guid)).cloned();
+        self.create_self_as(pos, walk, dress);
+    }
+
+    /// The own unit wearing `dress` (race, sex, look and gear; `None`: the roster's race and sex,
+    /// nothing worn). In a combat it is the seed's hero ([`Self::self_pending`]).
+    fn create_self_as(&mut self, pos: [f32; 3], walk: f32, dress: Option<Value>) {
+        let (Some(guid), Some(mut me)) = (self.self_guid, self.me.clone()) else { return };
+        if let Some(d) = &dress {
+            me.race = u8::try_from(d["race"].as_u64().unwrap_or(1)).unwrap_or(1).max(1);
+            me.gender = u8::try_from(d["gender"].as_u64().unwrap_or(0)).unwrap_or(0).min(1);
+        }
         let bytes0 = me.race as u32 | (me.class as u32) << 8 | (me.gender as u32) << 16;
+        let look = dress.as_ref().map_or([0; 5], body_look);
+        self.own_body = Some((me.race, me.gender, look));
         let mut fields = vec![
             (FIELD_UNIT_HEALTH, 100),
             (FIELD_UNIT_MAXHEALTH, 100),
@@ -1831,14 +2158,16 @@ impl Bridge {
             (FIELD_UNIT_BYTES_2, 0),
         ];
         self.drawn.insert(guid, 0);
-        // The hero's look and gear (`equipment.json`, through the roster).
-        if let Some(dress) = self.hero_dress.get(&me.guid).cloned() {
-            fields.extend(self.dress_fields(&dress));
+        // The hero's look and gear (the character config and `equipment.json`).
+        if let Some(dress) = &dress {
+            fields.extend(self.dress_fields(dress));
         }
         bevy::log::info!(
-            "exile: own unit for roster {} wears {} item(s)",
+            "exile: own unit for roster {} (race {} sex {}) wears {} item(s)",
             me.guid,
-            self.hero_dress.get(&me.guid).map_or(0, |d| d["items"].as_array().map_or(0, Vec::len))
+            me.race,
+            me.gender,
+            dress.as_ref().map_or(0, |d| d["items"].as_array().map_or(0, Vec::len))
         );
         self.emit(unit_create(
             walk,
@@ -2698,6 +3027,11 @@ fn wow_facing(dx: f32, dy: f32) -> f32 {
 fn angle_gap(a: f32, b: f32) -> f32 {
     let d = (a - b).rem_euclid(std::f32::consts::TAU);
     d.min(std::f32::consts::TAU - d)
+}
+
+/// A dress's look dials (skin, face, hair style, hair colour, facial hair).
+fn body_look(dress: &Value) -> [u64; 5] {
+    ["skin", "face", "hair", "hairColor", "facialHair"].map(|k| dress[k].as_u64().unwrap_or(0))
 }
 
 /// A race and sex's own body (`ChrRaces.dbc` male/female display): what a dressed unit wears its
