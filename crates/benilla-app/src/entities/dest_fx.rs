@@ -53,6 +53,8 @@ pub(super) struct GroundFx {
     loop_armed: bool,
     /// One-shot self-termination deadline (`time.elapsed_secs()`), set at attach.
     expires: Option<f32>,
+    /// The sequence to play (`AnimationData` id), else the model's `Stand`.
+    anim: Option<u16>,
 }
 
 impl GroundFx {
@@ -63,6 +65,7 @@ impl GroundFx {
             spawned: false,
             loop_armed: false,
             expires: None,
+            anim: None,
         }
     }
 }
@@ -194,6 +197,10 @@ pub(super) struct ExileRing {
     ring: (u32, f32),
 }
 
+/// Where a held range circle stops, seconds into its opening: drawn in full there, faded by its
+/// end (the aura rings' `Stand` runs about 1.4 s).
+const RING_DRAWN_AT: f32 = 0.8;
+
 /// How long a range circle's next pass overlaps the one ending, seconds.
 const RING_OVERLAP: f32 = 0.8;
 
@@ -252,12 +259,17 @@ pub(super) fn exile_ground_rings(
     });
     for (guid, (spell_id, scale)) in wanted {
         let Some(at) = under(guid) else { continue };
-        let path = spells
-            .catalog
-            .get(spell_id)
-            .and_then(|d| visuals.0.stages(d.visual))
+        // The spell's ground model: its area model (a DynamicObject's: Consecration, Hellfire),
+        // else its cast kit's model (an aura's ring at the feet: Retribution Aura).
+        let stages = spells.catalog.get(spell_id).and_then(|d| visuals.0.stages(d.visual));
+        let path = stages
             .filter(|s| s.area_effect != 0)
-            .and_then(|s| visuals.0.effect_path(s.area_effect));
+            .and_then(|s| visuals.0.effect_path(s.area_effect))
+            .or_else(|| {
+                let kit = visuals.0.kit(stages?.cast)?;
+                let effect = kit.effects().map(|(_, e)| e).next()?;
+                visuals.0.effect_path(effect)
+            });
         let Some(path) = path else {
             warn!("exile: range circle spell {spell_id} has no area effect model");
             crate::net::set_ground_ring(guid, None);
@@ -265,12 +277,25 @@ pub(super) fn exile_ground_rings(
         };
         let path = path.to_string();
         ensure_model(&mut fx, &asset_server, &path);
-        debug!("exile: range circle {path} under {guid:#x}, scale {scale:.2}");
-        // One pass of the model, then a fresh one next frame: its particles and fades run on the
-        // clock it was spawned with, so repeating the clip alone let it fade out for good after
-        // its first pass (user 2026-11-11). A new instance per pass keeps the circle burning.
+        // An aura ring authors `Hold` (158), its steady loop (user 2026-11-11: the range stays lit
+        // while the aura lasts, not pulsing): one instance, held for as long as the circle is
+        // wanted. A model without it (an area burst) plays one pass after another instead, since
+        // its particles and fades run on the clock it was spawned with.
+        let Some(model) = fx.models.get(&path) else { continue };
+        if model.parts.is_none() {
+            continue; // still loading: decided once it is in
+        }
+        let hold = model
+            .animations
+            .as_ref()
+            .is_some_and(|a| a.find(super::spell_fx::ANIM_HOLD).is_some());
+        info!("exile: range circle {path} under {guid:#x}, scale {scale:.2}, {}", if hold { "held" } else { "one pass" });
+        let mut gfx = GroundFx::new(path, hold);
+        if hold {
+            gfx.anim = Some(super::spell_fx::ANIM_HOLD);
+        }
         commands.spawn((
-            GroundFx::new(path, false),
+            gfx,
             ExileRing { guid, ring: (spell_id, scale) },
             Transform::from_translation(at).with_scale(Vec3::splat(scale)),
             Visibility::default(),
@@ -344,7 +369,7 @@ pub(super) fn attach_ground_fx_models(
 ) {
     let Some(mut fx) = fx else { return };
     let now = time.elapsed_secs();
-    for (entity, mut inst, player) in &mut instances {
+    for (entity, mut inst, mut player) in &mut instances {
         if !inst.spawned {
             ensure_model(&mut fx, &asset_server, &inst.path);
             let Some(dm) = fx.models.get(&inst.path) else {
@@ -358,8 +383,11 @@ pub(super) fn attach_ground_fx_models(
                 true, // a dest-anchored model's flat quads are ground decals
                 // Chained to nothing: its trail stays world-frozen and its pool finishes in place.
                 super::spell_fx::EffectHost::default(),
-                // Not a `CEffect` on a unit: its own span clock, the plain single-clip arm.
-                None,
+                // Not a `CEffect` on a unit: its own span clock, the plain single-clip arm. An Exile
+                // range circle plays its opening (`Stand`) once and holds its last frame, the
+                // drawn circle, for as long as it is wanted: the ring models' `Hold` draws nothing
+                // here. Riding its player's clock, its fades hold with it.
+                inst.anim.map(|_| crate::creature_anim::FxStage::OneShot),
                 &mut FxMaterials {
                     store: &mut wow_materials,
                     tint: &mut tint_reg,
@@ -382,8 +410,22 @@ pub(super) fn attach_ground_fx_models(
         }
         // The reference re-fires on completion (`0x5d5580`), the hardcoded sequence `0x9e` when
         // `obj+0x190` bit 1 is set (its source untraced); this repeats the first clip.
-        if inst.looping && !inst.loop_armed {
-            if let Some(mut player) = player {
+        // (A range circle's lifecycle hands its birth over to `Hold` itself: no repeat over it.)
+        // An Exile range circle stops at its drawn frame, [`RING_DRAWN_AT`] into its opening,
+        // and stays so: its fades ride the player's clock, so they hold too (user 2026-11-11:
+        // the circle stays lit while the aura lasts, no replay).
+        if inst.anim.is_some() && !inst.loop_armed {
+            if let Some(player) = player.as_mut() {
+                for (_, anim) in player.playing_animations_mut() {
+                    if anim.seek_time() >= RING_DRAWN_AT {
+                        anim.set_speed(0.0);
+                        inst.loop_armed = true;
+                    }
+                }
+            }
+        }
+        if inst.looping && inst.anim.is_none() && !inst.loop_armed {
+            if let Some(player) = player.as_mut() {
                 // Armed only once a clip is playing: the player can land a frame before its clip
                 // starts, and arming then repeated nothing, so the loop played once and faded
                 // (Exile's range circles, user 2026-11-11).

@@ -31,6 +31,7 @@ use benilla_world::vis_chain::VisChainOnly;
 
 use super::{BoneAttach, DisplayModel, EntityPart, ModelHandle};
 pub(super) use lifecycle::advance_fx_anim;
+pub(super) use lifecycle::ANIM_HOLD;
 use lifecycle::{decay_span, FxAnimLife, FxDecay};
 
 /// `CMissile`'s attach cascade (`0x61ceb0`) for a model lacking the requested point: `0xf`, then
