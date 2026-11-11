@@ -101,6 +101,32 @@ const FIELD_PLAYER_VISIBLE_ITEM_1_0: u16 = 260;
 const VISIBLE_ITEM_STRIDE: u16 = 12;
 /// A dressed unit's item templates: entry = this + the item's `ItemDisplayInfo` id.
 const DRESS_ITEM_BASE: u32 = 800_000;
+/// How many aura slots the bridge writes on a unit.
+const AURA_SLOTS_USED: usize = 8;
+/// `UNIT_FIELD_AURA` (the first of 48 slots) and `UNIT_FIELD_AURAFLAGS` (a nibble per slot).
+const FIELD_UNIT_AURA: u16 = 47;
+const FIELD_UNIT_AURAFLAGS: u16 = 95;
+
+/// The aura fields for `worn` in the first slots, the rest of the bridge's slots cleared; each
+/// worn slot's flag nibble names effect 0 (a slot without an effect bit reads empty).
+fn aura_fields(worn: &[u32]) -> Vec<(u16, u32)> {
+    let mut fields: Vec<(u16, u32)> = (0..AURA_SLOTS_USED)
+        .map(|i| (FIELD_UNIT_AURA + i as u16, worn.get(i).copied().unwrap_or(0)))
+        .collect();
+    let flags = (0..worn.len().min(AURA_SLOTS_USED)).fold(0u32, |f, i| f | 0x2 << (4 * i));
+    fields.push((FIELD_UNIT_AURAFLAGS, flags));
+    fields
+}
+
+/// A ring's spots around `centre` before they are set on the ground (the last frame's, as a
+/// move's start).
+fn ring_spots(centre: [f32; 3], radius: f32, count: usize) -> impl Iterator<Item = [f32; 3]> {
+    (0..count).map(move |i| {
+        let a = i as f32 / count as f32 * std::f32::consts::TAU;
+        [centre[0] + a.cos() * radius, centre[1] + a.sin() * radius, centre[2]]
+    })
+}
+
 /// How long a wand holder keeps the wand raised after a shot before its dagger stance.
 const WAND_STANCE_BACK: Duration = Duration::from_millis(1200);
 /// Dress entries with a sheath of their own sit above the plain ones: `base + display + sheath * stride`.
@@ -574,6 +600,10 @@ struct Bridge {
     /// DQQ id → (rider, where it was, until). A hit logged in the frame the projectile ends on
     /// still finds its projectile to cast from (user 2026-11-10).
     recent_projectiles: HashMap<String, (u64, [f32; 3], Instant)>,
+    /// The aura spells last written to each unit's aura slots ([`Self::auras`]).
+    worn_auras: HashMap<u64, Vec<u32>>,
+    /// Range rings: DQQ actor id → (its markers, the centre they were last placed around).
+    rings: HashMap<String, (Vec<u64>, [f32; 3])>,
 }
 
 impl Bridge {
@@ -641,6 +671,8 @@ impl Bridge {
             next_marker: 0,
             projectiles: HashMap::new(),
             recent_projectiles: HashMap::new(),
+            worn_auras: HashMap::new(),
+            rings: HashMap::new(),
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -1019,6 +1051,7 @@ impl Bridge {
         }
         let me = self.self_guid;
         self.engaged.clear();
+        self.end_auras();
         let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
         for guid in guids {
             self.emit(SessionEvent::ObjectDestroyed(guid));
@@ -1034,6 +1067,7 @@ impl Bridge {
         self.channels.clear();
         self.projectiles.clear();
         self.recent_projectiles.clear();
+
         benilla_world::exile_clear::set_clear_zone(None);
         (self.prepare_due, self.combat_due, self.clear_due) = (None, None, None);
         self.combat = None;
@@ -1086,7 +1120,9 @@ impl Bridge {
                 FIELD_PLAYER_BYTES,
                 n("skin") | n("face") << 8 | n("hair") << 16 | n("hairColor") << 24,
             ),
-            (FIELD_PLAYER_BYTES_2, 0),
+            // Byte 3 is the rest state, 2 normal as every 1.12 character has it: a 0 has no
+            // `Exhaustion.dbc` row and `GetRestState()`'s nil raises in `MainMenuBar.lua`.
+            (FIELD_PLAYER_BYTES_2, 2 << 24),
         ];
         for item in dress["items"].as_array().into_iter().flatten() {
             let m = |k: &str| u32::try_from(item[k].as_u64().unwrap_or(0)).unwrap_or(0);
@@ -1431,6 +1467,7 @@ impl Bridge {
                 self.emit(SessionEvent::AttackStop { attacker: me, victim });
             }
             self.engaged.clear();
+            self.end_auras();
             let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
             for guid in guids {
                 self.emit(SessionEvent::ObjectDestroyed(guid));
@@ -2075,6 +2112,7 @@ impl Bridge {
         }
         self.keep_engaged();
         self.projectiles(data);
+        self.auras(data);
         for ev in data["events"].as_array().into_iter().flatten() {
             self.play_event(ev);
         }
@@ -2374,6 +2412,105 @@ impl Bridge {
                 }
                 self.recent_projectiles.insert(id, (b, pos, at));
             }
+        }
+    }
+
+    /// The standing auras of DQQ's durations (`actors[].auras`, `skills.json` auras; PLAN-0006 D):
+    /// each unit's aura slots hold the borrowed aura spells while the duration lasts, so the
+    /// aura's state kit (a shield's bubble, a burn, ice at the feet) stays on it and goes with
+    /// it. `actors[].ring` is a range shown around the unit (user 2026-11-11: righteous fire as in
+    /// PoE): markers wearing the aura on a circle of that radius, carried along with the unit.
+    fn auras(&mut self, data: &Value) {
+        let mut ringed = HashSet::new();
+        for actor in data["actors"].as_array().into_iter().flatten() {
+            let Some(id) = actor["id"].as_str() else { continue };
+            let Some((guid, centre)) = self.shown.get(id).map(|s| (s.guid, s.pos)) else { continue };
+            let worn: Vec<u32> = actor["auras"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_u64().map(|a| a as u32))
+                .take(AURA_SLOTS_USED)
+                .collect();
+            if self.worn_auras.get(&guid).map_or(!worn.is_empty(), |w| *w != worn) {
+                self.emit(SessionEvent::ObjectValues { guid, fields: ObjectFields::from_pairs(&aura_fields(&worn)) });
+                self.worn_auras.insert(guid, worn);
+            }
+            let ring = &actor["ring"];
+            let (Some(spell), Some(radius)) = (ring["spell"].as_u64(), ring["radius"].as_f64()) else { continue };
+            let count = ring["count"].as_u64().unwrap_or(12).clamp(3, 24) as usize;
+            let radius = radius as f32 * YARDS_PER_UNIT;
+            ringed.insert(id.to_owned());
+            let spots: Vec<[f32; 3]> = (0..count)
+                .map(|i| {
+                    let a = i as f32 / count as f32 * std::f32::consts::TAU;
+                    self.ground.on_ground([centre[0] + a.cos() * radius, centre[1] + a.sin() * radius, centre[2]])
+                })
+                .collect();
+            if self.rings.get(id).is_some_and(|r| r.0.len() != count) {
+                self.drop_ring(id);
+            }
+            if let Some((markers, last)) = self.rings.get(id).cloned() {
+                if last == centre {
+                    continue;
+                }
+                for (marker, (to, from)) in markers.iter().zip(spots.iter().zip(ring_spots(last, radius, count))) {
+                    self.spline_id = self.spline_id.wrapping_add(1);
+                    self.emit(SessionEvent::MonsterMove {
+                        guid: *marker,
+                        transport: None,
+                        start: from,
+                        spline_id: self.spline_id,
+                        path: vec![from, *to],
+                        facing: MonsterMoveFacing::None,
+                        stop: false,
+                        duration_ms: TICK_MS.round() as u32,
+                        flying: true,
+                        run_mode: true,
+                    });
+                }
+                if let Some(r) = self.rings.get_mut(id) {
+                    r.1 = centre;
+                }
+                continue;
+            }
+            let fields = aura_fields(&[spell as u32]);
+            let markers: Vec<u64> = spots
+                .iter()
+                .map(|at| {
+                    let m = self.marker_at(*at, 1.0);
+                    super::set_muted(m, true);
+                    self.emit(SessionEvent::ObjectValues { guid: m, fields: ObjectFields::from_pairs(&fields) });
+                    m
+                })
+                .collect();
+            bevy::log::info!("exile: aura ring {spell} around {id}: {count} markers at {radius:.1} yd");
+            self.rings.insert(id.to_owned(), (markers, centre));
+        }
+        let gone: Vec<String> = self.rings.keys().filter(|k| !ringed.contains(*k)).cloned().collect();
+        for id in gone {
+            self.drop_ring(&id);
+        }
+    }
+
+    /// A combat's auras end with it: the rings go, and the player's own body (which outlives the
+    /// combat) is cleared of the hero's auras.
+    fn end_auras(&mut self) {
+        let ids: Vec<String> = self.rings.keys().cloned().collect();
+        for id in ids {
+            self.drop_ring(&id);
+        }
+        if let Some(me) = self.self_guid.filter(|m| self.worn_auras.get(m).is_some_and(|w| !w.is_empty())) {
+            self.emit(SessionEvent::ObjectValues { guid: me, fields: ObjectFields::from_pairs(&aura_fields(&[])) });
+        }
+        self.worn_auras.clear();
+    }
+
+    /// Removes a unit's range ring (its markers go at the next timer pass).
+    fn drop_ring(&mut self, id: &str) {
+        if let Some((markers, _)) = self.rings.remove(id) {
+            let now = Instant::now();
+            self.markers.extend(markers.into_iter().map(|m| (m, now)));
         }
     }
 
