@@ -604,6 +604,8 @@ struct Bridge {
     worn_auras: HashMap<u64, Vec<u32>>,
     /// Range rings: DQQ actor id → (its markers, the centre they were last placed around).
     rings: HashMap<String, (Vec<u64>, [f32; 3])>,
+    /// Range circles: DQQ actor id → (its unit, the circle's spell and scale).
+    circles: HashMap<String, (u64, (u32, f32))>,
 }
 
 impl Bridge {
@@ -673,6 +675,7 @@ impl Bridge {
             recent_projectiles: HashMap::new(),
             worn_auras: HashMap::new(),
             rings: HashMap::new(),
+            circles: HashMap::new(),
             ready_quiet: None,
             ready_sent: true,
             replay_file: None,
@@ -2422,6 +2425,7 @@ impl Bridge {
     /// PoE): markers wearing the aura on a circle of that radius, carried along with the unit.
     fn auras(&mut self, data: &Value) {
         let mut ringed = HashSet::new();
+        let mut circled = HashSet::new();
         for actor in data["actors"].as_array().into_iter().flatten() {
             let Some(id) = actor["id"].as_str() else { continue };
             let Some((guid, centre)) = self.shown.get(id).map(|s| (s.guid, s.pos)) else { continue };
@@ -2437,7 +2441,19 @@ impl Bridge {
                 self.worn_auras.insert(guid, worn);
             }
             let ring = &actor["ring"];
-            let (Some(spell), Some(radius)) = (ring["spell"].as_u64(), ring["radius"].as_f64()) else { continue };
+            // A circle on the ground (`area`: a ground spell's area model, scaled from the
+            // `native` radius it was made for to the range), drawn by the client under the unit.
+            if let (Some(area), Some(radius)) = (ring["area"].as_u64().filter(|a| *a != 0), ring["radius"].as_f64()) {
+                let native = ring["native"].as_f64().filter(|n| *n > 0.0).unwrap_or(8.0) as f32;
+                let circle = (area as u32, radius as f32 * YARDS_PER_UNIT / native);
+                if self.circles.insert(id.to_owned(), (guid, circle)) != Some((guid, circle)) {
+                    bevy::log::info!("exile: range circle {area} under {id}, scale {:.2}", circle.1);
+                    super::set_ground_ring(guid, Some(circle));
+                }
+                circled.insert(id.to_owned());
+                continue;
+            }
+            let (Some(spell), Some(radius)) = (ring["spell"].as_u64().filter(|s| *s != 0), ring["radius"].as_f64()) else { continue };
             let count = ring["count"].as_u64().unwrap_or(12).clamp(3, 24) as usize;
             let radius = radius as f32 * YARDS_PER_UNIT;
             ringed.insert(id.to_owned());
@@ -2491,6 +2507,12 @@ impl Bridge {
         for id in gone {
             self.drop_ring(&id);
         }
+        let gone: Vec<String> = self.circles.keys().filter(|k| !circled.contains(*k)).cloned().collect();
+        for id in gone {
+            if let Some((guid, _)) = self.circles.remove(&id) {
+                super::set_ground_ring(guid, None);
+            }
+        }
     }
 
     /// A combat's auras end with it: the rings go, and the player's own body (which outlives the
@@ -2499,6 +2521,9 @@ impl Bridge {
         let ids: Vec<String> = self.rings.keys().cloned().collect();
         for id in ids {
             self.drop_ring(&id);
+        }
+        for (_, (guid, _)) in self.circles.drain() {
+            super::set_ground_ring(guid, None);
         }
         if let Some(me) = self.self_guid.filter(|m| self.worn_auras.get(m).is_some_and(|w| !w.is_empty())) {
             self.emit(SessionEvent::ObjectValues { guid: me, fields: ObjectFields::from_pairs(&aura_fields(&[])) });

@@ -182,6 +182,77 @@ pub(super) fn arm_ground_effects(
     }
 }
 
+/// Exile of Azeroth: a range circle under a unit ([`crate::net::set_ground_ring`]): the area
+/// effect model of a borrowed ground spell (Consecration's circle…), looping, scaled to the range
+/// and kept under the unit as it moves. A deviation: the reference draws these only for a
+/// DynamicObject, unscaled.
+#[derive(Component)]
+pub(super) struct ExileRing {
+    guid: u64,
+    ring: (u32, f32),
+}
+
+/// Spawn, follow and remove the range circles.
+pub(super) fn exile_ground_rings(
+    mut commands: Commands,
+    mut rings: Query<(Entity, &ExileRing, &mut Transform)>,
+    index: Option<Res<crate::net::GuidIndex>>,
+    units: Query<&GlobalTransform, Without<ExileRing>>,
+    visuals: Option<Res<SpellVisuals>>,
+    spells: Option<Res<crate::ui_action::Spells>>,
+    fx: Option<ResMut<SpellFx>>,
+    asset_server: Res<AssetServer>,
+) {
+    if !crate::net::exile_mode() {
+        return;
+    }
+    let (Some(index), Some(visuals), Some(spells), Some(mut fx)) = (index, visuals, spells, fx) else {
+        return;
+    };
+    let mut wanted = crate::net::ground_rings();
+    if wanted.is_empty() && rings.is_empty() {
+        return;
+    }
+    let under = |guid: u64| index.0.get(&guid).and_then(|e| units.get(*e).ok()).map(GlobalTransform::translation);
+    for (entity, ring, mut tf) in &mut rings {
+        match (wanted.remove(&ring.guid), under(ring.guid)) {
+            (Some(now), Some(at)) if now == ring.ring => {
+                if tf.translation != at {
+                    tf.translation = at;
+                }
+            }
+            (other, _) => {
+                commands.entity(entity).despawn();
+                // A changed circle is drawn anew next frame.
+                let _ = other;
+            }
+        }
+    }
+    for (guid, (spell_id, scale)) in wanted {
+        let Some(at) = under(guid) else { continue };
+        let path = spells
+            .catalog
+            .get(spell_id)
+            .and_then(|d| visuals.0.stages(d.visual))
+            .filter(|s| s.area_effect != 0)
+            .and_then(|s| visuals.0.effect_path(s.area_effect));
+        let Some(path) = path else {
+            warn!("exile: range circle spell {spell_id} has no area effect model");
+            crate::net::set_ground_ring(guid, None);
+            continue;
+        };
+        let path = path.to_string();
+        ensure_model(&mut fx, &asset_server, &path);
+        info!("exile: range circle {path} under {guid:#x}, scale {scale:.2}");
+        commands.spawn((
+            GroundFx::new(path, true),
+            ExileRing { guid, ring: (spell_id, scale) },
+            Transform::from_translation(at).with_scale(Vec3::splat(scale)),
+            Visibility::default(),
+        ));
+    }
+}
+
 /// Spawn the GO dest one-shots at once, never waiting on the DynamicObject create that follows.
 pub(super) fn spawn_ground_bursts(
     mut commands: Commands,

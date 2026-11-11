@@ -74,6 +74,27 @@ pub(crate) fn muted(guid: u64) -> bool {
     MUTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&guid))
 }
 
+/// Exile's range circles (PLAN-0006 D, user 2026-11-11): a unit's guid → (the spell whose area
+/// effect model lies on the ground under it, its scale). `entities::dest_fx` draws them.
+static GROUND_RINGS: std::sync::Mutex<Option<HashMap<u64, (u32, f32)>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_ground_ring(guid: u64, ring: Option<(u32, f32)>) {
+    let mut map = GROUND_RINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match ring {
+        Some(r) => {
+            map.insert(guid, r);
+        }
+        None => {
+            map.remove(&guid);
+        }
+    }
+}
+
+pub(crate) fn ground_rings() -> HashMap<u64, (u32, f32)> {
+    GROUND_RINGS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
 /// Exile deviation: spell damage the bridge plays (PLAN-0006 D) has no swing, so the victim's
 /// wound vocal is queued here by guid (`crit`) and played by `sound::combat` like a swing's.
 static WOUNDS: std::sync::Mutex<Vec<(u64, bool)>> = std::sync::Mutex::new(Vec::new());

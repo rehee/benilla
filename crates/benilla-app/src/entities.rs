@@ -84,7 +84,8 @@ use spell_fx::{attach_spell_fx, resolve_spell_fx};
 /// Dest-anchored spell effects: a DynamicObject's area visual and a cast's burst at its point.
 pub(crate) mod dest_fx;
 use dest_fx::{
-    arm_ground_effects, attach_ground_fx_models, spawn_ground_bursts, tick_shard_emitters,
+    arm_ground_effects, attach_ground_fx_models, exile_ground_rings, spawn_ground_bursts,
+    tick_shard_emitters,
 };
 
 /// Spell chain beams, such as Chain Lightning's arcs.
@@ -733,7 +734,7 @@ impl Plugin for EntitiesPlugin {
                 move_missiles,
                 spawn_missiles,
                 // The dest-anchored lane's three independent producers also create entries.
-                (arm_ground_effects, spawn_ground_bursts, tick_shard_emitters),
+                (arm_ground_effects, spawn_ground_bursts, tick_shard_emitters, exile_ground_rings),
                 // The glue screens' character and pet assemble in their own stage, ahead of
                 // `Update` (`attach::glue_stage`).
                 update_display_models.in_set(DisplayBuildSet),
