@@ -497,10 +497,15 @@ fn drive_vplates(
         let sort_pt = Vec2::new(0.4 * diag, viewport.y - 0.3 * diag);
         let mut cands = Vec::new();
         let mut spots = std::collections::HashSet::new();
+        let watching = crate::net::exile_spectating();
         for (entity, net, guid, tf, store) in &world.units {
             // The camera's own unit (`0x60f68c`); our body is a candidate while we are attached to
             // another unit.
-            if !matches!(net.kind, EntityKind::Unit | EntityKind::Player) || entity == centre {
+            // Exile deviation (PLAN-0004 C): a watched replay shows every unit's health over its
+            // head, the hero's own included, anywhere on the battlefield.
+            if !matches!(net.kind, EntityKind::Unit | EntityKind::Player)
+                || (entity == centre && !watching)
+            {
                 continue;
             }
             // The unit's scene node, drawn in the last render (`0x60f63b`-`0x60f650`): culled by
@@ -509,7 +514,7 @@ fn drive_vplates(
                 continue;
             }
             // Measured from the camera's unit (`0x60f780`-`0x60f7b8`).
-            if (tf.translation - centre_pos).length_squared() > MAX_DIST_SQ {
+            if !watching && (tf.translation - centre_pos).length_squared() > MAX_DIST_SQ {
                 continue;
             }
             // Behind the camera or outside the viewport there is no plate: `0x60f600` destroys it
@@ -852,6 +857,31 @@ impl Plugin for VPlatesPlugin {
                 // so the plates paint the same frame.
                 drive_vplates.after(TargetUpdate).in_set(VPlateSet),
             );
+        if crate::net::exile_mode() {
+            app.add_systems(Update, exile_plates.before(VPlateSet));
+        }
+    }
+}
+
+/// Exile deviation (PLAN-0004 C, user 2026-11-07: every unit's health shows over its head): while
+/// a combat replay is watched both plate bits are on, whatever the player's own setting, which
+/// comes back when the replay is over.
+fn exile_plates(mut mode: ResMut<VPlateMode>, mut own: Local<Option<VPlateMode>>) {
+    let all = VPlateMode {
+        enemies: true,
+        friends: true,
+    };
+    if crate::net::exile_spectating() {
+        if own.is_none() {
+            *own = Some(*mode);
+        }
+        if *mode != all {
+            *mode = all;
+        }
+    } else if let Some(was) = own.take() {
+        if *mode != was {
+            *mode = was;
+        }
     }
 }
 

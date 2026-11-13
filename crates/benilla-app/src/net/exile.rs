@@ -548,7 +548,10 @@ struct Bridge {
     lineup_only: Vec<String>,
     /// Creature template entry → name, answered to `CreatureQuery`.
     creature_names: HashMap<u32, String>,
-    /// A combat creature's name → its creature entry.
+    /// Creature template entry → its rank (the portrait's dragon: 1 elite, 4 rare), for a combat
+    /// creature of a rarity (PLAN-0004 C); absent is 0.
+    creature_ranks: HashMap<u32, u32>,
+    /// A combat creature's name (and rank, when it has one) → its creature entry.
     combat_entries: HashMap<String, u32>,
     /// Dressed units ([`Self::dress_create`]): their names (`NameQuery`), the item templates their
     /// gear points at (`ItemQuery`), and the next guid (a player's high guid, 0, so names resolve
@@ -672,6 +675,7 @@ impl Bridge {
             lineup: Vec::new(),
             lineup_only: Vec::new(),
             creature_names: HashMap::new(),
+            creature_ranks: HashMap::new(),
             combat_entries: HashMap::new(),
             player_names: HashMap::new(),
             emote_book: None,
@@ -838,7 +842,8 @@ impl Bridge {
             }
             ClientCommand::CreatureQuery { entry, .. } => {
                 let name = self.creature_names.get(entry).cloned();
-                self.emit(creature_name(*entry, name));
+                let rank = self.creature_ranks.get(entry).copied().unwrap_or(0);
+                self.emit(creature_name(*entry, name, rank));
             }
             // Names: the player's own (addon lines name it as their sender); any other is unknown.
             ClientCommand::NameQuery { guid } => self.answer_name(*guid),
@@ -998,7 +1003,7 @@ impl Bridge {
             // create reads the cache.
             let entry = LINEUP_ENTRY + i as u32;
             self.creature_names.insert(entry, name.clone());
-            self.emit(creature_name(entry, Some(name)));
+            self.emit(creature_name(entry, Some(name), 0));
             let scale = self.models.unit_scale(display, size, false);
             self.emit(unit_create(
                 FREE_WALK_SPEED,
@@ -1113,6 +1118,7 @@ impl Bridge {
         self.focus = None;
         self.phase = Phase::Free;
         super::set_exile_spectating(false);
+        super::clear_unit_marks();
         self.emote_state = 0;
         self.drawn.clear();
         self.wand_back.clear();
@@ -1659,6 +1665,7 @@ impl Bridge {
             }
             self.engaged.clear();
             self.end_auras();
+            super::clear_unit_marks();
             let guids: Vec<u64> = self.shown.drain().map(|(_, s)| s.guid).filter(|g| Some(*g) != me).collect();
             for guid in guids {
                 self.emit(SessionEvent::ObjectDestroyed(guid));
@@ -2233,7 +2240,13 @@ impl Bridge {
                     // The hero is the human female standard: her size is her scale.
                     // Weapons away to start (`UNIT_FIELD_BYTES_2` byte 0): the engage's draw is
                     // then a change the anim layer adopts, even when the last combat ended drawn.
-                    let mut fields = vec![(FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits()), (FIELD_UNIT_BYTES_2, 0)];
+                    // Its health is DQQ's, as every unit's (PLAN-0004 C: its bar over its head).
+                    let mut fields = vec![
+                        (FIELD_OBJECT_SCALE_X, actor_size(actor).to_bits()),
+                        (FIELD_UNIT_BYTES_2, 0),
+                        (FIELD_UNIT_MAXHEALTH, max_life),
+                        (FIELD_UNIT_HEALTH, life),
+                    ];
                     self.drawn.insert(me, 0);
                     // The seed's gear (user 2026-11-07: combat shows the recording's character),
                     // every held and worn slot set, so what the seed lacks comes off. Home again,
@@ -2393,11 +2406,16 @@ impl Bridge {
                 // Its name (the DQQ mob's, else the actor's): a creature entry per name, filed
                 // ahead of the unit, whose name query asks by it (it read "Unknown" without).
                 let name = actor["mob"].as_str().or(actor["name"].as_str()).filter(|n| !n.is_empty()).unwrap_or("Enemy").to_owned();
+                // Its rarity's rank (PLAN-0004 C: the portrait's dragon) is the template's, so a
+                // rare and a plain monster of one name take an entry each.
+                let rank = actor["rank"].as_u64().unwrap_or(0) as u32;
+                let key = if rank == 0 { name.clone() } else { format!("{name}\u{1}{rank}") };
                 let next = COMBAT_ENTRY + self.combat_entries.len() as u32;
-                let entry = *self.combat_entries.entry(name.clone()).or_insert(next);
+                let entry = *self.combat_entries.entry(key).or_insert(next);
                 if entry == next {
                     self.creature_names.insert(entry, name.clone());
-                    self.emit(creature_name(entry, Some(name)));
+                    self.creature_ranks.insert(entry, rank);
+                    self.emit(creature_name(entry, Some(name), rank));
                 }
                 self.emit(unit_create(
                     COMBAT_WALK_SPEED,
@@ -2420,6 +2438,12 @@ impl Bridge {
                 ));
                 guid
                 };
+                // A monster's rarity (PLAN-0004 C): its name's colour on its plate (white is the
+                // plate's own) and its body's outer glow.
+                if actor["kind"].as_str() == Some("enemy") {
+                    super::set_name_colour(guid, hex_rgb(&actor["nameColor"]).filter(|c| *c != [255, 255, 255]));
+                    super::set_glow(guid, hex_rgb(&actor["glow"]));
+                }
                 self.shown.insert(
                     id.to_owned(),
                     Shown {
@@ -2439,18 +2463,18 @@ impl Bridge {
         for key in gone {
             if let Some(s) = self.shown.remove(&key) {
                 self.engaged.remove(&s.guid);
-                if s.enemy {
-                    // DQQ drops a slain enemy from its frame at once: it dies first (health 0, so
-                    // its death animation and cry play) and its corpse lies a moment.
-                    if s.life > 0 {
-                        self.emit(SessionEvent::ObjectValues {
-                            guid: s.guid,
-                            fields: ObjectFields::from_pairs(&[(FIELD_UNIT_HEALTH, 0)]),
-                        });
-                    }
+                // DQQ drops a slain unit from its frame at once: it dies first (health 0, so its
+                // death animation and cry play) and its corpse lies a moment. A hero's side falls
+                // the same way (PLAN-0004 B); the player's own body is never taken away, it lies
+                // until the field is cleared.
+                if s.life > 0 {
+                    self.emit(SessionEvent::ObjectValues {
+                        guid: s.guid,
+                        fields: ObjectFields::from_pairs(&[(FIELD_UNIT_HEALTH, 0)]),
+                    });
+                }
+                if Some(s.guid) != self.self_guid {
                     self.markers.push((s.guid, Instant::now() + CORPSE_LIFE));
-                } else {
-                    self.emit(SessionEvent::ObjectDestroyed(s.guid));
                 }
             }
         }
@@ -3250,15 +3274,25 @@ fn item_info(display: u32, inventory_type: u32, class: u32, subclass: u32, sheat
     }
 }
 
+/// An `RRGGBB` string as its bytes; anything else is none.
+fn hex_rgb(v: &Value) -> Option<[u8; 3]> {
+    let s = v.as_str()?;
+    if s.len() != 6 {
+        return None;
+    }
+    let n = u32::from_str_radix(s, 16).ok()?;
+    Some([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+}
+
 /// `SMSG_CREATURE_QUERY_RESPONSE`'s stand-in: a creature template's name (`None`: unknown).
-fn creature_name(entry: u32, name: Option<String>) -> SessionEvent {
+fn creature_name(entry: u32, name: Option<String>, rank: u32) -> SessionEvent {
     SessionEvent::CreatureName {
         entry,
         name,
         subname: None,
         creature_type: None,
         pet_family: 0,
-        rank: 0,
+        rank,
         type_flags: 0,
         pet_spell_list: 0,
         display_id: 0,

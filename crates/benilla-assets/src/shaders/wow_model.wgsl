@@ -389,6 +389,25 @@ fn body_tint(fade_tag: u32) -> vec3<f32> {
     );
 }
 
+// Exile of Azeroth deviation (PLAN-0004 C): a unit's outer glow, in the tint word's top byte
+// (`instance_tint::with_glow`): its colour packed 3-3-2, 0x00 and 0xff (every stock word) none.
+fn exile_glow(fade_tag: u32) -> vec3<f32> {
+    let g = wow_light.rig_tint[(fade_tag >> 19u) & 0x7ffu] >> 24u;
+    if (g == 0u || g == 255u) {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(
+        f32((g >> 5u) & 7u) / 7.0,
+        f32((g >> 2u) & 7u) / 7.0,
+        f32(g & 3u) / 3.0,
+    );
+}
+
+// The glow's strength: a rim that brightens where the surface turns from the eye, over a faint
+// wash of the whole body. Restrained (user 2026-11-12): enough to tell an elite from the rest.
+const EXILE_GLOW_RIM: f32 = 0.6;
+const EXILE_GLOW_WASH: f32 = 0.06;
+
 // The hover/target highlight (tag bit 31): the scene's committed ambient
 // (`0x614576`-`0x6145bd`), added to the batch colour inside the final clamp, lit or unlit
 // (`c29`). Sampled live, where the reference holds the value sampled when the highlight
@@ -872,6 +891,25 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     if (stage1_on) {
         // The diffuse alpha is the batch and instance alpha, the shader's `obj_fade`.
         rgb = stage1_rgb(stage1_preset, rgb, tex1, obj_fade);
+    }
+
+    // Exile: the outer glow, added over the lit texel and under the fog, on a unit's solid batches
+    // (not its additive or modulating ones, which are already light).
+    let glow = exile_glow(fade_tag);
+    if (!is_wmo && !is_mod && !is_mod2x && (u32(m.clutter_fade.z) & 4u) == 0u
+        && (glow.r + glow.g + glow.b) > 0.0) {
+        let n_len2 = dot(in.world_normal, in.world_normal);
+        var rim = 0.0;
+        if (n_len2 > 1e-12) {
+            let to_eye = normalize(view.world_position - in.world_position.xyz);
+            let facing = abs(dot(normalize(in.world_normal), to_eye));
+            rim = pow(1.0 - facing, 2.0);
+        }
+        rgb = clamp(
+            rgb + glow * (EXILE_GLOW_WASH + EXILE_GLOW_RIM * rim),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
     }
 
     // Linear fog by planar eye depth, as in terrain.wgsl. Per-batch colour policy (`clutter_fade.z`

@@ -205,6 +205,51 @@ pub(crate) fn take_wounds() -> Vec<(u64, bool)> {
     std::mem::take(&mut *WOUNDS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// Exile's unit marks (PLAN-0004 C): a combat unit's guid → the colour of its name on its plate
+/// (a DQQ monster's rarity, PoE style) and the colour of its body's outer glow (elites and bosses).
+/// The stock client colours neither per unit.
+static NAME_COLOURS: std::sync::Mutex<Option<HashMap<u64, [u8; 3]>>> = std::sync::Mutex::new(None);
+static GLOWS: std::sync::Mutex<Option<HashMap<u64, [u8; 3]>>> = std::sync::Mutex::new(None);
+
+fn set_mark(marks: &std::sync::Mutex<Option<HashMap<u64, [u8; 3]>>>, guid: u64, rgb: Option<[u8; 3]>) {
+    let mut map = marks.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    match rgb {
+        Some(c) => {
+            map.insert(guid, c);
+        }
+        None => {
+            map.remove(&guid);
+        }
+    }
+}
+
+pub(crate) fn set_name_colour(guid: u64, rgb: Option<[u8; 3]>) {
+    set_mark(&NAME_COLOURS, guid, rgb);
+}
+
+pub(crate) fn name_colour(guid: u64) -> Option<[u8; 3]> {
+    NAME_COLOURS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&guid).copied()
+}
+
+pub(crate) fn set_glow(guid: u64, rgb: Option<[u8; 3]>) {
+    set_mark(&GLOWS, guid, rgb);
+}
+
+/// Every glowing unit ([`set_glow`]); empty outside a combat.
+pub(crate) fn glows() -> HashMap<u64, [u8; 3]> {
+    GLOWS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
+/// The combat is cleared: no unit keeps a name colour or a glow.
+pub(crate) fn clear_unit_marks() {
+    for marks in [&NAME_COLOURS, &GLOWS] {
+        if let Some(map) = marks.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            map.clear();
+        }
+    }
+}
+
 pub(crate) fn beam_tint(guid: u64) -> Option<[f32; 3]> {
     BEAM_TINTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&guid).copied()
 }

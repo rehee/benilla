@@ -117,10 +117,14 @@ impl Judge<'_> {
         let (health, max_health) = store.map_or((0.0, 0.0), bar_of);
         let my_level = self.my_level;
         // The level the plate shows (`0x7cbb7a` → `0x7cbce0`), which its skull and colour read.
-        let level = store.and_then(|s| {
-            s.0.unit_level()
-                .map(|level| self.displayed_level(guid, s, level))
-        });
+        // Exile deviation (PLAN-0004 C): a watched replay's plates carry no level, as DQQ's units
+        // have none to compare (every one would read 1).
+        let level = store
+            .filter(|_| !crate::net::exile_spectating())
+            .and_then(|s| {
+                s.0.unit_level()
+                    .map(|level| self.displayed_level(guid, s, level))
+            });
         let mark = self.group.map_or(0, |g| g.raid_target_index(guid));
         PlateUnit {
             health,
@@ -130,7 +134,12 @@ impl Judge<'_> {
             name: self
                 .names
                 .and_then(|n| n.resolve_unit(guid, store, Ask::Read))
-                .map(str::to_owned),
+                // Exile deviation (PLAN-0004 C): a monster's name in its rarity's colour, as a
+                // colour escape in the text, which the plate's own white, yellow and red modulate.
+                .map(|n| match crate::net::name_colour(guid) {
+                    Some([r, g, b]) => format!("|cff{r:02x}{g:02x}{b:02x}{n}|r"),
+                    None => n.to_owned(),
+                }),
             // The skull (`0x7cbb40`): rank 3 through `gated_rank` (so a charmed boss shows its
             // level), or a hostile 10 or more levels up that is not grey (`0x5f0700`, vacuous
             // there but transcribed). A unit with no level yet shows neither.

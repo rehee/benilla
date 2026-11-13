@@ -48,6 +48,19 @@ pub fn pack(rgb: [u8; 3]) -> u32 {
     0xff00_0000 | (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2])
 }
 
+/// Exile of Azeroth deviation (PLAN-0004 C): a unit's outer glow rides its tint word's top byte,
+/// which the reference always writes `0xff`. The glow's colour is packed 3-3-2 (`RRRGGGBB`) there,
+/// `0x00` and `0xff` both reading as no glow (so every stock word is glowless); the low 24 bits
+/// stay the tint, white when the unit has none. `wow_model.wgsl`'s `exile_glow` unpacks it.
+pub fn with_glow(word: u32, glow: [u8; 3]) -> u32 {
+    let packed = (u32::from(glow[0]) >> 5 << 5) | (u32::from(glow[1]) >> 5 << 2) | (u32::from(glow[2]) >> 6);
+    let tint = if word == IDENTITY { 0x00ff_ffff } else { word & 0x00ff_ffff };
+    match packed {
+        0 | 0xff => word,
+        g => (g << 24) | tint,
+    }
+}
+
 /// Off-world `wow_light`-layout buffers that also carry the tint region, by key; deliberately not
 /// [`crate::rig_palette::RigPaletteMirrors`]' list. Portraits stay off it: the reference bakes one
 /// from a fresh CM2 with colour (1,1,1) and alpha 1 (`0x524f60`, ctor `0x70ea60`, set again at

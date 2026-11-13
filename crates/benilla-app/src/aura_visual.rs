@@ -140,14 +140,30 @@ pub(crate) fn apply_aura_tint(
     )>,
     mut tints: ResMut<benilla_world::instance_tint::InstanceTints>,
     mut probe_logged: Local<bool>,
+    // Exile: the unit a rig belongs to, for its outer glow.
+    owners: Query<(
+        Option<&crate::net::Guid>,
+        Option<&benilla_world::model_fade::ParentModel>,
+    )>,
 ) {
     let probe = tint_probe();
     let mut painted = 0usize;
+    // Exile deviation (PLAN-0004 C): an elite's or a boss's outer glow rides the tint word.
+    let glows = if crate::net::exile_mode() {
+        crate::net::glows()
+    } else {
+        Default::default()
+    };
     for (root, rig) in &rigs {
-        let word = probe.or_else(|| chained_tint(&chain, root)).map_or(
+        let mut word = probe.or_else(|| chained_tint(&chain, root)).map_or(
             benilla_world::instance_tint::IDENTITY,
             benilla_world::instance_tint::pack,
         );
+        if !glows.is_empty() {
+            if let Some(rgb) = chained_guid(&owners, root).and_then(|g| glows.get(&g)) {
+                word = benilla_world::instance_tint::with_glow(word, *rgb);
+            }
+        }
         tints.set(rig.slot, word);
         painted += 1;
     }
@@ -155,6 +171,28 @@ pub(crate) fn apply_aura_tint(
         *probe_logged = true;
         info!("tint probe: painted {painted} live rig slot(s)");
     }
+}
+
+/// The unit a rig belongs to: its own guid, else the nearest up its
+/// [`benilla_world::model_fade::ParentModel`] chain (a rigged item glows with its wearer).
+fn chained_guid(
+    owners: &Query<(
+        Option<&crate::net::Guid>,
+        Option<&benilla_world::model_fade::ParentModel>,
+    )>,
+    instance: Entity,
+) -> Option<u64> {
+    let mut at = instance;
+    for _ in 0..benilla_world::model_fade::MAX_MODEL_CHAIN {
+        let Ok((guid, parent)) = owners.get(at) else {
+            return None;
+        };
+        if let Some(guid) = guid {
+            return Some(guid.0);
+        }
+        at = parent?.0;
+    }
+    None
 }
 
 /// The tint a rig renders with: its own head node, else the nearest up its
