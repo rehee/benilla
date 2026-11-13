@@ -215,6 +215,11 @@ impl CastReports {
 /// is set, where the reference pushes `""` (`0x6e7a2d`) and still fires, so the bar is a
 /// full-length untitled one. The channel bar names differently ([`channel_start_name`]).
 fn cast_bar_label(spells: Option<&crate::ui_action::Spells>, id: u32) -> String {
+    // Exile replay (user 2026-11-12): the hero's reads are borrowed spells (a charge-up's kneel),
+    // so the bar carries no name for now.
+    if crate::net::exile_spectating() {
+        return String::new();
+    }
     spells
         .and_then(|s| s.catalog.get(id))
         .filter(|d| !d.no_casting_bar_text())

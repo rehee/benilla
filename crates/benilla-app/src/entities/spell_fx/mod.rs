@@ -828,7 +828,16 @@ fn reap_matching(
         let span = i
             .root
             .and_then(|_| fx.models.get(&i.path))
-            .and_then(|dm| decay_span(dm.animations.as_ref()));
+            .and_then(|dm| decay_span(dm.animations.as_ref()))
+            // Exile replay (user 2026-11-13): a buff's effect leaves within 0.1 s of the buff,
+            // not over its model's own decay (about a second).
+            .map(|s| {
+                if crate::net::exile_spectating() && i.class == FxClass::AuraState {
+                    s.min(EXILE_AURA_DECAY)
+                } else {
+                    s
+                }
+            });
         let (Some(root), Some(span)) = (i.root, span) else {
             if let Some(root) = i.root {
                 end_root(commands, emitters, root); // destroyed at once
@@ -932,9 +941,13 @@ pub(super) fn attach_spell_fx(
                     .id();
                 (root, true)
             } else {
+                // Exile (user 2026-11-12): a breath effect moved to the casting hand keeps the
+                // mouth's forward frame (the hand bone's points up) and shifts toward the hand.
+                let at_hand = inst.tag == EXILE_BREATH_AT_HAND;
+                let look_tag = if at_hand { 0x11 } else { inst.tag };
                 // `CMissile`'s cascade: the slot's tag, `0xf`, `0x13`, else the unit root.
                 let point = bones.and_then(|b| {
-                    std::iter::once(inst.tag)
+                    std::iter::once(look_tag)
                         .chain(ATTACH_FALLBACKS)
                         .find_map(|tag| b.points.get(&tag).copied().map(|p| (tag, p)))
                         .and_then(|(tag, (bone, offset))| {
@@ -945,6 +958,7 @@ pub(super) fn attach_spell_fx(
                 });
                 let ground_anchor = point.is_none_or(|(tag, ..)| tag == 0x13);
                 let (parent, offset) = point.map_or((unit, Vec3::ZERO), |(_, j, o)| (j, o));
+                let offset = if at_hand { offset + EXILE_BREATH_TO_HAND_SHIFT } else { offset };
                 let root = commands
                     .spawn((Transform::from_translation(offset), Visibility::default()))
                     // Chain-only, as above.
@@ -2063,3 +2077,19 @@ mod tests {
         );
     }
 }
+
+/// Exile (user 2026-11-12): the attach tag a breath effect takes when it should spray from the
+/// casting hand. It rides the breath point, whose frame faces forward, shifted by
+/// [`EXILE_BREATH_TO_HAND_SHIFT`]; the hand bone's own frame would point the spray upward.
+pub(crate) const EXILE_BREATH_AT_HAND: u16 = 0xFF11;
+/// From the mouth to about the right hand at a directed cast, in the breath point's frame, Bevy
+/// axes as the attach offsets are (`wow_to_bevy`: WoW forward 0.7, left -0.3, up -0.45 yards — out
+/// to the pushed-forward hand, to the right and down to chest height; the borrowed dragon breath
+/// is built partly behind its origin, user 2026-11-12: 0.25 forward still started in the chest).
+/// It is in the breath joint's own frame, so it grows with the body: the unit's render scale
+/// (DQQ size, `OBJECT_FIELD_SCALE_X`) sits on the rig root above every joint anchor.
+const EXILE_BREATH_TO_HAND_SHIFT: Vec3 = Vec3::new(0.3, -0.45, -0.7);
+
+/// Exile replay: the longest a buff's state effect takes to leave once the buff is gone (user
+/// 2026-11-13), cutting the model's own decay short.
+const EXILE_AURA_DECAY: f32 = 0.1;

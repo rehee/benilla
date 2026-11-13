@@ -91,6 +91,9 @@ const CHANNEL_HOLD: Duration = Duration::from_millis(800);
 const RAY_LIFE: Duration = Duration::from_millis(900);
 /// How long after an area marker is created its effect is cast (its model built first).
 const MARKER_EMBODY: Duration = Duration::from_millis(250);
+/// A both-hands strike's gap between the mainhand and the offhand swing (user 2026-11-12): 1.12 has
+/// no clip swinging both at once, and two swings in one frame leave only the second.
+const PAIR_SWING_GAP: Duration = Duration::from_millis(200);
 /// A thrown javelin's missile: the javelin's own look (`config/mapping/equipment.json` Javelin).
 const JAVELIN_DISPLAY: u32 = 1733;
 const FIELD_UNIT_NATIVEDISPLAYID: u16 = 132;
@@ -608,6 +611,8 @@ struct Bridge {
     markers: Vec<(u64, Instant)>,
     /// Casts waiting for their marker's model ([`MARKER_EMBODY`]): (caster, target, spell, when).
     marker_casts: Vec<(u64, u64, u32, Instant)>,
+    /// Offhand swings owed by a both-hands strike: (attacker, victim, damage, crit, school, due).
+    pair_swings: Vec<(u64, u64, u32, bool, u8, Instant)>,
     /// Channels waiting for their marker's model: (channeller, channel object, spell, when).
     marker_channels: Vec<(u64, u64, u32, Instant)>,
     /// Units channelling a skill (PLAN-0006 D §2.2): unit → (channel spell, held until). Each of
@@ -695,6 +700,7 @@ impl Bridge {
             next_dressed: 0x0010_0000,
             markers: Vec::new(),
             marker_casts: Vec::new(),
+            pair_swings: Vec::new(),
             marker_channels: Vec::new(),
             channels: HashMap::new(),
             next_marker: 0,
@@ -1095,6 +1101,7 @@ impl Bridge {
             self.emit(SessionEvent::ObjectDestroyed(guid));
         }
         self.marker_casts.clear();
+        self.pair_swings.clear();
         self.marker_channels.clear();
         self.channels.clear();
         self.projectiles.clear();
@@ -1600,6 +1607,11 @@ impl Bridge {
         self.marker_casts = waiting;
         for (caster, target, spell, _) in due {
             self.cast_go(caster, target, spell, "marker");
+        }
+        let (due, waiting): (Vec<_>, Vec<_>) = self.pair_swings.drain(..).partition(|p| now >= p.5);
+        self.pair_swings = waiting;
+        for (attacker, victim, damage, crit, school, _) in due {
+            self.swing(attacker, victim, damage, crit, school, true);
         }
         let ended: Vec<u64> = self.channels.iter().filter(|(_, c)| now >= c.1).map(|(g, _)| *g).collect();
         for unit in ended {
@@ -2482,7 +2494,7 @@ impl Bridge {
             // The cast (Cast / Launch phase): the spell's cast animation, self kit and missile.
             "CastSkill" | "ActiveAura" => {
                 let Some(caster) = guid_of("from") else { return };
-                if spell == 0 || matches!(action, "melee" | "mobAttack" | "none") {
+                if spell == 0 || matches!(action, "melee" | "mobAttack" | "none" | "special" | "special2H" | "bothHands") {
                     return;
                 }
                 let target = guid_of("target").unwrap_or(caster);
@@ -2503,7 +2515,44 @@ impl Bridge {
             // cannon's charge-up and dash, …), cast by and on that unit.
             "DurationStart" => {
                 if let (Some(unit), true) = (guid_of("target"), spell != 0) {
-                    self.cast_go(unit, unit, spell, action);
+                    // `hit: false` (the invincibility's special attack, user 2026-11-12): the cast alone.
+                    if ev["hit"].as_bool() == Some(false) {
+                        self.cast_only(unit, spell);
+                    } else {
+                        self.cast_go(unit, unit, spell, action);
+                    }
+                }
+            }
+            // A skill's charge-up (user 2026-11-12, the beam cannon's): the hero reads `spell` for
+            // the charge's length (`amount`, seconds); the read loops its precast pose (kneeling).
+            "ChargeUpStart" => {
+                if let (Some(unit), true) = (guid_of("from"), spell != 0) {
+                    let secs = ev["amount"].as_f64().unwrap_or(0.0).max(0.1);
+                    self.emit(SessionEvent::SpellStart {
+                        caster: unit,
+                        spell_id: spell,
+                        cast_flags: 0,
+                        cast_time_ms: (secs * 1000.0).round() as u32,
+                        target: None,
+                        ammo_display_id: None,
+                    });
+                }
+            }
+            // The charge ends (its dash began, or the charge's buff is gone): the read stops.
+            "ChargeUpEnd" => {
+                if let (Some(unit), true) = (guid_of("from"), spell != 0) {
+                    self.emit(SessionEvent::SpellFailedOther { caster: unit, spell_id: spell });
+                    // The hero is the player's own body, whose cast bar a cast result closes: a
+                    // success with nothing in flight is SPELLCAST_STOP, the bar gone (user 2026-11-12).
+                    if Some(unit) == self.self_guid {
+                        self.emit(SessionEvent::CastResult { spell_id: spell, success: true, reason: None, arg: None });
+                    }
+                }
+            }
+            // A hero's dash (user 2026-11-12): Charge's cast — its whoosh, chest trail and landing dust.
+            "DashStart" => {
+                if let (Some(unit), true) = (guid_of("from"), spell != 0) {
+                    self.cast_only(unit, spell);
                 }
             }
             // A skill's area (shape, radius, centre): its effect at the centre, sized to the
@@ -2518,6 +2567,49 @@ impl Bridge {
                 let Some(at) = at else { return };
                 let scale = ev["scale"].as_f64().unwrap_or(1.0) as f32;
                 self.area_effect(at, scale, spell);
+            }
+            // A cleave's arc in front of its caster (PLAN-0006 D, 2026-11-12): the caster turns to
+            // the area's centre (or its target) and casts the borrowed cone spell, cast only — a
+            // dragon's flame breath, a cone of cold, a warrior's cleave swoosh. The hits come with
+            // the damage events.
+            // A swing's cleave (user 2026-11-12): the caster casts it for the swoosh alone — its kit
+            // animation (Cleave's Special1H) is muted, since the attack the skill's tags choose comes
+            // with the damage (a Basic/Core skill's plain swing, masked on the move). No turn: a
+            // stop-facing would halt the caster's run.
+            "SkillRangeAndTarget" if action == "coneSwing" && spell != 0 => {
+                let Some(caster) = guid_of("from") else { return };
+                super::mute_next_cast_anim(spell);
+                self.cast_only(caster, spell);
+            }
+            "SkillRangeAndTarget" if action == "cone" && spell != 0 => {
+                let Some(caster) = guid_of("from") else { return };
+                let pos_of = |k: &str| ev[k].as_str().and_then(|id| self.shown.get(id)).map(|s| s.pos);
+                let at = pos_of("from");
+                let centre = match (ev["centerX"].as_f64(), ev["centerY"].as_f64()) {
+                    (Some(x), Some(y)) => Some(self.to_world(x, y)),
+                    _ => pos_of("target"),
+                };
+                if let (Some(at), Some(centre)) = (at, centre) {
+                    let (dx, dy) = (centre[0] - at[0], centre[1] - at[1]);
+                    if dx.hypot(dy) > 0.05 {
+                        self.spline_id = self.spline_id.wrapping_add(1);
+                        self.emit(SessionEvent::MonsterMove {
+                            guid: caster,
+                            transport: None,
+                            start: at,
+                            spline_id: self.spline_id,
+                            path: Vec::new(),
+                            facing: MonsterMoveFacing::Angle(wow_facing(dx, dy)),
+                            stop: true,
+                            duration_ms: 0,
+                            flying: false,
+                            run_mode: false,
+                        });
+                    }
+                }
+                // The flame sprays from the casting hand (user 2026-11-12).
+                super::breath_to_hand_next(spell);
+                self.cast_only(caster, spell);
             }
             // A spinning skill's projectile reaching its enemies (user 2026-11-10): the projectile
             // (the unit riding its path) casts the spin there, its whirl and whoosh; gone already,
@@ -2618,26 +2710,36 @@ impl Bridge {
             "DamageTaken" => {
                 let Some(victim) = guid_of("target") else { return };
                 let attacker = guid_of("from").unwrap_or(victim);
-                if matches!(action, "melee" | "mobAttack") && attacker != victim {
+                if matches!(action, "melee" | "mobAttack" | "bothHands") && attacker != victim {
                     // A bow hero's melee attack swings the bow two-handed (user 2026-11-09).
                     if self.ranged.contains(&attacker) {
                         self.draw(attacker, 1);
                         self.wand_back.remove(&attacker);
                     }
-                    self.emit(SessionEvent::AttackerState(AttackerState {
-                        attacker,
-                        victim,
-                        // HITINFO_AFFECTS_VICTIM, plus HITINFO_CRITICALHIT.
-                        hit_info: 0x2 | if crit { 0x80 } else { 0 },
-                        damage: amount,
-                        victim_state: 1,
-                        absorb: 0,
-                        resist: 0,
-                        blocked: 0,
-                        melee_spell_id: 0,
-                        school: u32::from(school),
-                    }));
+                    if action == "bothHands" {
+                        // Both hands at once (user 2026-11-12): the mainhand now with half the
+                        // damage, the offhand a moment later with the rest.
+                        let first = (amount / 2).max(1);
+                        self.swing(attacker, victim, first, crit, school, false);
+                        if amount > first {
+                            self.pair_swings.push((attacker, victim, amount - first, crit, school, Instant::now() + PAIR_SWING_GAP));
+                        }
+                        return;
+                    }
+                    // A dual wielder's swings take turns (user 2026-11-12): the runtime marks the offhand's.
+                    let off = ev["offHand"].as_bool() == Some(true);
+                    self.swing(attacker, victim, amount, crit, school, off);
                     return;
+                }
+                // A special attack (user 2026-11-12: a skill without the Basic or Core tag): the
+                // attacker casts the borrowed strike — Heroic Strike's Special1H, Slam's Special2H, the
+                // client's own unarmed swap — with its impact on the victim; the number as a spell's.
+                if matches!(action, "special" | "special2H") && spell != 0 && attacker != victim {
+                    if self.ranged.contains(&attacker) {
+                        self.draw(attacker, 1);
+                        self.wand_back.remove(&attacker);
+                    }
+                    self.cast_go(attacker, victim, spell, action);
                 }
                 let periodic = action == "none";
                 if !periodic {
@@ -2766,7 +2868,15 @@ impl Bridge {
                 .take(AURA_SLOTS_USED)
                 .collect();
             if self.worn_auras.get(&guid).map_or(!worn.is_empty(), |w| *w != worn) {
+                if benilla_assets::trace::enabled() {
+                    benilla_assets::trace::line(
+                        "fx",
+                        &format!("exile aura write guid={guid:#x} self={} worn={worn:?}", Some(guid) == self.self_guid),
+                    );
+                }
                 self.emit(SessionEvent::ObjectValues { guid, fields: ObjectFields::from_pairs(&aura_fields(&worn)) });
+                // No packet end follows, so no field edge: the aura watcher rescans the unit itself.
+                super::rescan_auras(guid);
                 self.worn_auras.insert(guid, worn);
             }
             let ring = &actor["ring"];
@@ -2933,6 +3043,24 @@ impl Bridge {
                 });
             }
         }
+    }
+
+    /// An auto-attack swing (`SMSG_ATTACKERSTATEUPDATE`): the client plays the mainhand swing, or
+    /// with HITINFO_LEFTSWING the offhand's (dagger 88, other weapons 87, empty hand 117).
+    fn swing(&mut self, attacker: u64, victim: u64, damage: u32, crit: bool, school: u8, off: bool) {
+        self.emit(SessionEvent::AttackerState(AttackerState {
+            attacker,
+            victim,
+            // HITINFO_AFFECTS_VICTIM, plus HITINFO_LEFTSWING and HITINFO_CRITICALHIT.
+            hit_info: 0x2 | if off { 0x4 } else { 0 } | if crit { 0x80 } else { 0 },
+            damage,
+            victim_state: 1,
+            absorb: 0,
+            resist: 0,
+            blocked: 0,
+            melee_spell_id: 0,
+            school: u32::from(school),
+        }));
     }
 
     /// A borrowed spell's cast alone: `SMSG_SPELL_GO` with no unit hit, so its cast animation and

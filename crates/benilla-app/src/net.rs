@@ -31,6 +31,84 @@ pub(crate) fn exile_mode() -> bool {
 }
 
 /// Exile mode's combat replay is on screen (D29): the player watches, the camera is theirs alone.
+/// Exile: casts whose kit animation is not played (user 2026-11-12) — a cleave's swoosh on a
+/// swing, whose own Special1H would replace the attack the skill's tags choose. One entry per
+/// queued cast, taken by the first kit play of that spell.
+static EXILE_MUTED_CAST_ANIMS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Exile: the next kit play of `spell` plays its effects and sound but not its animation.
+pub(crate) fn mute_next_cast_anim(spell: u32) {
+    if let Ok(mut v) = EXILE_MUTED_CAST_ANIMS.lock() {
+        v.push(spell);
+    }
+}
+
+/// Whether this kit play of `spell` was muted ([`mute_next_cast_anim`]); takes the entry.
+pub(crate) fn take_muted_cast_anim(spell: u32) -> bool {
+    let Ok(mut v) = EXILE_MUTED_CAST_ANIMS.lock() else { return false };
+    match v.iter().position(|s| *s == spell) {
+        Some(i) => {
+            v.swap_remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Exile: casts whose mouth-attached effects (`breath`, attachment tag 0x11) move to the right hand
+/// (0x16) — a flame cone sprayed from the casting hand, not the body (user 2026-11-12). One entry
+/// per queued cast, taken by the first kit play of that spell carrying a breath effect.
+static EXILE_BREATH_TO_HAND: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Exile: the next kit play of `spell` with a breath effect attaches it to the right hand.
+pub(crate) fn breath_to_hand_next(spell: u32) {
+    if let Ok(mut v) = EXILE_BREATH_TO_HAND.lock() {
+        v.push(spell);
+    }
+}
+
+/// Whether this kit play of `spell` moves its breath effects to the hand; takes the entry.
+pub(crate) fn take_breath_to_hand(spell: u32) -> bool {
+    let Ok(mut v) = EXILE_BREATH_TO_HAND.lock() else { return false };
+    match v.iter().position(|s| *s == spell) {
+        Some(i) => {
+            v.swap_remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Exile: units whose aura slots the bridge just rewrote. The bridge writes values blocks without
+/// closing a packet (`ObjectUpdateEnd`), so no field edge reaches the aura watcher; it rescans
+/// these instead (user 2026-11-12: a hero's buffs never showed — only units born wearing one did).
+/// The queue is written from the bridge thread at once, but the values block lands only when the
+/// session events are drained, so a single rescan could read the old slots (a buff's effect then
+/// outlived it, user 2026-11-13): each unit is rescanned every frame until its window passes.
+static EXILE_AURA_RESCAN: std::sync::Mutex<Vec<(u64, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// How long after a rewrite the aura watcher keeps rescanning the unit.
+const EXILE_AURA_RESCAN_WINDOW: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Exile: have the aura watcher rescan `guid` (its aura slots changed) for a short window.
+pub(crate) fn rescan_auras(guid: u64) {
+    if let Ok(mut v) = EXILE_AURA_RESCAN.lock() {
+        let until = std::time::Instant::now() + EXILE_AURA_RESCAN_WINDOW;
+        match v.iter_mut().find(|(g, _)| *g == guid) {
+            Some(entry) => entry.1 = until,
+            None => v.push((guid, until)),
+        }
+    }
+}
+
+/// The guids still inside their rescan window ([`rescan_auras`]); expired ones are dropped.
+pub(crate) fn take_aura_rescans() -> Vec<u64> {
+    let Ok(mut v) = EXILE_AURA_RESCAN.lock() else { return Vec::new() };
+    let now = std::time::Instant::now();
+    v.retain(|(_, until)| now < *until);
+    v.iter().map(|(g, _)| *g).collect()
+}
+
 static EXILE_SPECTATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a combat replay is being watched: the camera then never returns behind the body on its

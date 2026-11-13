@@ -536,6 +536,9 @@ pub(crate) fn held_strike_sound(
 }
 
 /// A kit's populated effect slots; a slot with no `SpellVisualEffectName` path is skipped.
+/// The kit's breath attachment (field 8), as `KIT_SLOT_TAGS` maps it.
+const BREATH_TAG: u16 = 0x11;
+
 fn resolve_kit_effects(visuals: &SpellVisualCatalog, kit: &VisualKit) -> Vec<FxSlot> {
     kit.effects()
         .filter_map(|(tag, effect)| {
@@ -627,7 +630,9 @@ fn play_kit(
     visuals: &SpellVisualCatalog,
     out: &mut KitOut,
 ) {
-    if let Some(anim_id) = kit.anim_id {
+    // Exile (user 2026-11-12): a muted cast plays its effects without the kit's animation.
+    let muted = !play.stage_2 && kit.anim_id.is_some() && crate::net::exile_mode() && crate::net::take_muted_cast_anim(spell_id);
+    if let Some(anim_id) = kit.anim_id.filter(|_| !muted) {
         if play.stage_2 {
             // Stage 2 compares, never plays; the driver holds the armed id and compares. Any id of
             // 0 or more reaches it (`0x60f366 jl`), Stand included.
@@ -676,7 +681,16 @@ fn play_kit(
     if !play.effects {
         return;
     }
-    let effects = resolve_kit_effects(visuals, kit);
+    let mut effects = resolve_kit_effects(visuals, kit);
+    // Exile (user 2026-11-12): a flame cone sprays from the casting hand, not the mouth.
+    // The entry is taken on the cast's first effects play, breath or not (a cone of cold has none).
+    if crate::net::exile_mode() && !play.stage_2 && crate::net::take_breath_to_hand(spell_id) {
+        for e in &mut effects {
+            if e.tag == BREATH_TAG {
+                e.tag = crate::entities::spell_fx::EXILE_BREATH_AT_HAND;
+            }
+        }
+    }
     if !effects.is_empty() {
         out.fx.write(SpellKitFx::Begin {
             entity,
@@ -1326,6 +1340,8 @@ pub(crate) fn arm_aura_state_fx(
     units: Query<(Entity, &ObjectStore), Without<ItemObject>>,
     arrived: Query<Entity, (Added<ObjectStore>, Without<ItemObject>)>,
     mut edges: MessageReader<FieldChanged>,
+    // Exile: the bridge's aura rewrites, which close no packet and so raise no edge.
+    index: Option<Res<crate::net::GuidIndex>>,
     visuals: Option<Res<SpellVisuals>>,
     spells: Option<Res<crate::ui_action::Spells>>,
     mut fx: MessageWriter<SpellKitFx>,
@@ -1347,6 +1363,13 @@ pub(crate) fn arm_aura_state_fx(
         units.iter().collect::<Vec<_>>()
     } else {
         let mut due: EntityHashSet = arrived.iter().collect();
+        if let Some(index) = index.as_deref() {
+            for guid in crate::net::take_aura_rescans() {
+                if let Some(&e) = index.0.get(&guid) {
+                    due.insert(e);
+                }
+            }
+        }
         for e in edges.read().filter(|e| {
             e.unit_array_slot(AURA_WATCH_BASE, AURA_WATCH_SPAN)
                 .is_some()
@@ -1403,9 +1426,18 @@ pub(crate) fn arm_aura_state_fx(
                 continue;
             }
             let Some(kit) = resolve_kit(spells, &visuals.0, spell_id, |s| s.state, || None) else {
+                if benilla_assets::trace::enabled() {
+                    benilla_assets::trace::line("fx", &format!("aura arm unit={entity} spell={spell_id}: no state kit"));
+                }
                 continue; // no state kit
             };
             let effects = resolve_kit_effects(&visuals.0, &kit);
+            if benilla_assets::trace::enabled() {
+                benilla_assets::trace::line(
+                    "fx",
+                    &format!("aura arm unit={entity} spell={spell_id} effects={:?}", effects.iter().map(|e| (e.tag, e.path.as_str())).collect::<Vec<_>>()),
+                );
+            }
             let nodes: Vec<crate::aura_visual::AuraNode> = kit
                 .char_procs()
                 .filter_map(crate::aura_visual::node_for)

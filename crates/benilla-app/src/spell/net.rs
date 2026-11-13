@@ -1501,8 +1501,9 @@ fn spell_start(
             }
         );
     }
-    // Our own timed cast opens the bar.
-    if self_guid.0 == Some(caster) && cast_time_ms > 0 && !ranged_slot {
+    // Our own timed cast opens the bar. Exile replay (user 2026-11-12): no bar — DQQ logs no read,
+    // and the hero's reads are borrowed for their pose alone (a charge-up's kneel).
+    if self_guid.0 == Some(caster) && cast_time_ms > 0 && !ranged_slot && !crate::net::exile_spectating() {
         reports.bar(CastBarEdge::Start {
             spell_id,
             cast_time_ms,
